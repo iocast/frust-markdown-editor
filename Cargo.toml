@@ -11,7 +11,7 @@ documentation = "https://docs.rs/frust-markdown-editor"
 readme = "README.md"
 keywords = ["frust", "markdown", "editor", "wysiwyg", "commonmark"]
 categories = ["gui", "text-editors"]
-exclude = [".github/", ".claude/", "scripts/", "todo.txt", "website/", "examples/web/"]
+exclude = [".cargo/", ".github/", ".claude/", "scripts/", "todo.txt", "website/", "examples/web/"]
 
 [features]
 default = []
