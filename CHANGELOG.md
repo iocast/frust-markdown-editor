@@ -5,6 +5,11 @@ Format: Keep a Changelog (https://keepachangelog.com), versioning: Semantic Vers
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-18
+
+### Fixed
+- Dragging a selection to the edge of the view now scrolls along (with `markdown-editor-core` 0.1.1 or newer)
+
 ## [0.3.1] - 2026-11-18
 
 ### Changed
@@ -14,5 +19,6 @@ Format: Keep a Changelog (https://keepachangelog.com), versioning: Semantic Vers
 ### Fixed
 - A double click sometimes selected only part of a word, when the mouse moved slightly during the click; dragging after a double or triple click now extends the selection by whole words or paragraphs
 
-[unreleased]: https://github.com/iocast/frust-markdown-editor/compare/v0.3.1...HEAD
+[unreleased]: https://github.com/iocast/frust-markdown-editor/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/iocast/frust-markdown-editor/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/iocast/frust-markdown-editor/releases/tag/v0.3.1
