@@ -14,18 +14,7 @@ use crate::geometry::{Color, Point, Rectangle, Size};
 use crate::i18n::{self, Language};
 use crate::style::Palette;
 
-/// State of the open link dialog. The address lives in
-/// `EditorState::link_url`, like for the link bar.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct LinkDialog {
-    /// Text to display; `None` when the selection cannot be retyped
-    /// (several paragraphs, images, raw HTML).
-    pub text: Option<String>,
-    /// The selected text when the dialog opened.
-    pub original: String,
-    /// The selection already is a link.
-    pub editing: bool,
-}
+pub(crate) use markdown_editor_core::editor::LinkDialog;
 
 /// Width of the dialog box.
 const WIDTH: f32 = 440.0;

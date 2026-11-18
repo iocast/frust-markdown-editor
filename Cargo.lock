@@ -1237,20 +1237,14 @@ dependencies = [
 name = "frust-markdown-editor"
 version = "0.3.1"
 dependencies = [
- "ab_glyph",
- "arboard",
  "fluent-bundle",
  "fluent-syntax",
  "frust-core",
  "frust-ui",
- "image",
- "imagesize",
- "png",
- "pulldown-cmark",
+ "markdown-editor-core",
  "rfd",
  "serde",
  "serde_json",
- "syntect",
  "tokio",
  "unic-langid",
  "web-time",
@@ -2492,6 +2486,22 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
+name = "markdown-editor-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56f1bf79666e6a320a1de8d1c1f9d3a2e9dd8cf9ffea2fbcc4323717254c7550"
+dependencies = [
+ "ab_glyph",
+ "arboard",
+ "image",
+ "imagesize",
+ "png",
+ "pulldown-cmark",
+ "syntect",
+ "web-time",
+]
 
 [[package]]
 name = "memchr"

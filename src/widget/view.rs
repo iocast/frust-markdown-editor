@@ -9,15 +9,14 @@
 
 use super::chrome::{self, Bar, Item, Menu, Slot, Status};
 use super::dialog::{self, DialogView};
-use super::edit::builtin_command;
 use super::menu::ContextMenu;
 use super::toolbar;
 use super::{Action, Command, EditorState, Effect, Inner, Link};
 use crate::doc::Selection;
-use crate::draw::{self, Frame, Op};
+use crate::draw::{self, Op};
 use crate::features::Features;
 use crate::fonts;
-use crate::geometry::{Point, Rectangle, Size};
+use crate::geometry::{Point, Rectangle, Size, ToFrust as _, ToKurbo as _};
 use crate::keyboard::{self, Key, Modifiers, Named, ScrollDelta};
 use crate::layout::Layout;
 use crate::platform;
@@ -34,6 +33,7 @@ use frust::authoring::{
 };
 use frust::{TextInputView, text_input};
 use frust_core::event::PointerSource;
+use markdown_editor_core::editor::builtin_command;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -668,6 +668,8 @@ impl EditorWidget {
             match effect {
                 Effect::WriteClipboard(text) => ctx.write_clipboard(text),
                 Effect::ReadClipboard => ctx.request_paste(),
+                // The widget focuses and cycles the dialog's fields itself.
+                Effect::FocusLinkDialog | Effect::CycleLinkFocus => {}
             }
         }
     }
@@ -1782,9 +1784,9 @@ impl EditorWidget {
         scene.push_transform(at(rect.x, rect.y));
         scene.push_clip(frust::kurbo::Point::ZERO, rect.size().to_kurbo());
 
-        let mut desk = Frame::new(rect.size());
+        let mut desk = draw::frame(rect.size());
         render::draw_desk(&mut desk, &page.layout, &page.palette, rect.size());
-        desk.replay(scene, None);
+        draw::replay(desk.ops(), scene, None);
 
         // Document content, culled to what is visible.
         scene.push_transform(frust::kurbo::Affine::translate((-sx as f64, -sy as f64)));
@@ -1792,17 +1794,17 @@ impl EditorWidget {
         draw::replay(&page.scene, scene, Some(visible));
 
         // Selection and caret.
-        let mut overlay = Frame::new(rect.size());
+        let mut overlay = draw::frame(rect.size());
         render::draw_selection(&mut overlay, &page.layout, page.sel, &page.palette);
         if page.focused && !page.link_open && self.caret_phase().0 {
             render::draw_caret(&mut overlay, &page.layout, page.sel, &page.palette);
         }
-        overlay.replay(scene, Some(visible));
+        draw::replay(overlay.ops(), scene, Some(visible));
         scene.pop_transform();
 
         // Scrollbars.
         let (vertical, horizontal) = scrollbars(page, rect.size());
-        let mut bars = Frame::new(rect.size());
+        let mut bars = draw::frame(rect.size());
         for (bar, dragging) in [
             (vertical, matches!(self.drag, Drag::Vertical(_))),
             (horizontal, matches!(self.drag, Drag::Horizontal(_))),
@@ -1828,7 +1830,7 @@ impl EditorWidget {
                 },
             );
         }
-        bars.replay(scene, None);
+        draw::replay(bars.ops(), scene, None);
 
         scene.pop_clip();
         scene.pop_transform();
@@ -1837,7 +1839,7 @@ impl EditorWidget {
     fn paint_bars(&self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
         let origin = ctx.origin();
         scene.push_transform(frust::kurbo::Affine::translate((origin.x, origin.y)));
-        let mut frame = Frame::new(self.size);
+        let mut frame = draw::frame(self.size);
         for (id, bar, (rect, slots)) in [
             (BarId::Toolbar, &self.bars.toolbar, &self.toolbar),
             (BarId::Link, &self.bars.link, &self.link_bar),
@@ -1878,7 +1880,7 @@ impl EditorWidget {
                 }
             }
         }
-        frame.replay(scene, None);
+        draw::replay(frame.ops(), scene, None);
         scene.pop_transform();
     }
 
@@ -1886,7 +1888,7 @@ impl EditorWidget {
     fn paint_menu(&self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
         let origin = ctx.origin();
         scene.push_transform(frust::kurbo::Affine::translate((origin.x, origin.y)));
-        let mut frame = Frame::new(self.size);
+        let mut frame = draw::frame(self.size);
         if let Some((dropdown, menu)) = self.open_menu() {
             let hovered = self.menu.and_then(|menu| menu.hovered);
             chrome::draw_menu(&mut frame, &dropdown, &menu, hovered, &self.page.palette);
@@ -1899,7 +1901,7 @@ impl EditorWidget {
                 &self.page.palette,
             );
         }
-        frame.replay(scene, None);
+        draw::replay(frame.ops(), scene, None);
         scene.pop_transform();
     }
 
@@ -1910,7 +1912,7 @@ impl EditorWidget {
         };
         let origin = ctx.origin();
         scene.push_transform(frust::kurbo::Affine::translate((origin.x, origin.y)));
-        let mut frame = Frame::new(self.size);
+        let mut frame = draw::frame(self.size);
         dialog::draw(
             &mut frame,
             view,
@@ -1919,7 +1921,7 @@ impl EditorWidget {
             &self.page.palette,
             self.slot_status(BarId::Dialog),
         );
-        frame.replay(scene, None);
+        draw::replay(frame.ops(), scene, None);
         scene.pop_transform();
     }
 

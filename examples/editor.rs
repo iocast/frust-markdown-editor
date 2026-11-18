@@ -17,9 +17,10 @@ use frust::{
     text,
 };
 use frust_markdown_editor::{
-    CodeHighlighter, Command, EditorState, EditorStyle, Event, ImageId, ImageSettings, KeyBinding,
-    Language, Margins, Measure, Orientation, Output, PageSize, Paper, PastedImage,
-    SyntectHighlighter, ZoomSettings, ZoomShortcuts, markdown_editor,
+    CodeHighlighter, Command, EditorState, EditorStyle, Event, FromTheme, ImageId,
+    ImageRejectionMessage, ImageSettings, KeyBinding, Language, Margins, Measure, Orientation,
+    Output, PageSize, Paper, PastedImage, SyntectHighlighter, ZoomSettings, ZoomShortcuts,
+    markdown_editor,
 };
 use std::fmt;
 use std::path::{Path, PathBuf};

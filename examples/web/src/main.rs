@@ -17,8 +17,8 @@ use frust::{
     column, overlay_portal, row, scroll_view, text, use_context,
 };
 use frust_markdown_editor::{
-    Command, EditorState, EditorStyle, Event, ImageSettings, Output, Paper, SyntectHighlighter,
-    markdown_editor,
+    Command, EditorState, EditorStyle, Event, FromTheme, ImageSettings, Output, Paper,
+    SyntectHighlighter, markdown_editor,
 };
 use std::fmt;
 

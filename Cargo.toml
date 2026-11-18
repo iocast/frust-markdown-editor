@@ -16,32 +16,22 @@ exclude = [".github/", ".claude/", "scripts/", "todo.txt", "website/", "examples
 [features]
 default = []
 # Ready-made syntax highlighter for code blocks, based on syntect.
-syntect = ["dep:syntect"]
+syntect = ["markdown-editor-core/syntect"]
 # Show images; paste images from the clipboard (desktop).
-images = ["dep:arboard", "dep:png", "dep:imagesize", "dep:image"]
+images = ["markdown-editor-core/images"]
 
 [dependencies]
+# Document, Markdown, layout and editing: everything but the interface.
+markdown-editor-core = "^0.1"
 # The UI framework (crate `frust-ui`, imported as `frust`).
 frust = { package = "frust-ui", version = "^0.6" }
 # Only for `mark_pending_result_flush`, which the facade does not re-export.
 frust-core = "^0.6"
-ab_glyph = "^0.2"
-pulldown-cmark = { version = "^0.13", default-features = false, features = ["html"] }
 # Instant / SystemTime that also work in the browser.
 web-time = "^1.1"
 # Translations of the built-in toolbar and status bar (Project Fluent).
 fluent-bundle = "^0.16"
 unic-langid = "^0.9.6"
-# Pure-Rust regex engine: no Oniguruma C library needed.
-syntect = { version = "^5.3", default-features = false, features = ["default-fancy"], optional = true }
-imagesize = { version = "^0.15", optional = true }
-# Image decoding for display. Same version as frust-widgets uses.
-image = { version = "^0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"], optional = true }
-
-# Desktop only.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-arboard = { version = "^3.6", optional = true }
-png = { version = "^0.18", optional = true }
 
 [dev-dependencies]
 fluent-syntax = "^0.12"

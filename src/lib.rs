@@ -71,7 +71,7 @@
 //! [`Typography`] ([`EditorState::style`]).
 //!
 //! ```
-//! use frust_markdown_editor::{EditorState, EditorStyle};
+//! use frust_markdown_editor::{EditorState, EditorStyle, FromTheme};
 //!
 //! let editor = EditorState::new().style(EditorStyle::dark());
 //!
@@ -107,30 +107,24 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-pub(crate) mod doc;
 pub(crate) mod draw;
-pub mod extension;
-pub mod features;
 pub(crate) mod fonts;
 pub mod geometry;
-pub mod highlight;
 pub mod i18n;
 pub mod images;
 pub mod keyboard;
-pub(crate) mod layout;
-mod markdown;
-pub mod page;
 mod platform;
-mod render;
 pub mod style;
 pub mod widget;
-pub mod zoom;
+
+pub use markdown_editor_core::{extension, features, highlight, page, zoom};
+
+pub(crate) use markdown_editor_core::{doc, layout, render};
 
 #[cfg(feature = "syntect")]
 #[cfg_attr(docsrs, doc(cfg(feature = "syntect")))]
-pub mod syntect;
+pub use markdown_editor_core::syntect;
 
-pub use doc::{BlockKind, ColumnAlign};
 pub use extension::{BlockRenderer, RenderRequest};
 pub use features::Features;
 pub use fonts::{FONTS, MONO_FAMILY, SANS_FAMILY};
@@ -138,18 +132,19 @@ pub use geometry::{Color, Point, Rectangle, Size, Vector};
 pub use highlight::{CodeHighlighter, HighlightRequest, HighlightSpan};
 pub use i18n::Language;
 pub use images::{
-    ImageId, ImageLoader, ImageMode, ImageRejection, ImageSettings, ImageSource, PastedImage,
+    ImageId, ImageLoader, ImageMode, ImageRejection, ImageRejectionMessage, ImageSettings,
+    ImageSource, PastedImage,
 };
 pub use keyboard::{Key, Modifiers, Named};
-pub use markdown::normalize;
+pub use markdown_editor_core::{BlockKind, ColumnAlign, normalize};
 pub use page::{IsoSeries, Margins, Measure, Orientation, PageSize, Paper, ParseError, Unit};
-pub use style::{EditorStyle, Palette, Typography};
+pub use style::{EditorStyle, FromTheme, Palette, Typography};
 pub use widget::{
-    Action, Command, DEFAULT_TAB_WIDTH, EditorState, EditorView, Event, Formatting, Length,
-    MarkdownEditor, Mode, Output, markdown_editor,
+    Action, Command, DEFAULT_TAB_WIDTH, EditorCore, EditorState, EditorView, Event, Formatting,
+    Length, MarkdownEditor, Mode, Output, markdown_editor,
 };
 pub use zoom::{KeyBinding, ZoomSettings, ZoomShortcuts};
 
 #[cfg(feature = "syntect")]
 #[cfg_attr(docsrs, doc(cfg(feature = "syntect")))]
-pub use crate::syntect::SyntectHighlighter;
+pub use markdown_editor_core::SyntectHighlighter;
