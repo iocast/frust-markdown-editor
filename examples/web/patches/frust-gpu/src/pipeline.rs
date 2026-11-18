@@ -1,0 +1,2268 @@
+//! Render-pipeline variants and the cache that builds them predictably.
+//!
+//! The philosophy is Impeller's: a frame must never be the first place a
+//! pipeline state object gets compiled. Three pieces implement that here.
+//!
+//! - [`RenderPipelineDesc`] is a **value** describing one pipeline variant —
+//!   a [`ShaderId`] plus entry points, vertex layouts, topology, the four
+//!   render-state axes (`blend`, `format`, `sample_count`, `depth`) and an
+//!   optional explicit pipeline layout. Apart from that last, reference-counted
+//!   `wgpu::PipelineLayout` handle it holds no GPU object, so it can be listed
+//!   up front, sent to a worker thread, and hashed.
+//! - [`PipelineCache::warm_up`] takes a list of those descs and builds them on
+//!   a worker thread when the surface is installed, so the variants an app is
+//!   known to need exist before the first frame asks for one. At most one such
+//!   worker is ever alive per cache, and [`PipelineCache::shutdown`] — which
+//!   `Drop` calls — joins it, so no thread holding a clone of the device
+//!   outlives the cache.
+//! - [`PipelineCache::get_or_create`] compiles a variant at most once. If the
+//!   render thread asks for a variant that is still *queued* for the warm-up
+//!   worker, it does not wait its turn: it **steals** the job, builds it
+//!   inline, and marks the queue entry done (Impeller's
+//!   `PipelineCompileQueue::PerformJobEagerly`). If the worker is already
+//!   mid-build on that exact variant, the request waits for it rather than
+//!   compiling a second copy.
+//!
+//! ## The variant key
+//!
+//! Every desc collapses to a `u64` packed from six axes, the same trick as
+//! Impeller's `ContentContextOptions::ToKey`: fixed-width bit fields, one per
+//! axis, so lookup is an integer hash and two descs that differ in any axis
+//! can never collide.
+//!
+//! | Bits | Axis |
+//! |------|------|
+//! | `[0..16)`  | program — shader module + entry points + vertex layouts + topology |
+//! | `[16..28)` | color target format |
+//! | `[28..40)` | blend state (`None` is its own value) |
+//! | `[40..52)` | depth/stencil state (`None` is its own value) |
+//! | `[52..56)` | `log2(sample_count)` |
+//! | `[56..64)` | pipeline layout (`None` — wgpu's derived layout — is its own value) |
+//!
+//! wgpu's render-state types are far too wide to pack literally (a
+//! `BlendState` alone is six enums), so the four wide axes are **interned**:
+//! each distinct value seen gets the next index in a small side table, and the
+//! index is what the bit field holds. That is exact — unlike a truncated
+//! content hash, no two distinct values can ever share a field — at the cost
+//! of a key being meaningful only within one cache instance, which is all it
+//! is ever used for.
+//!
+//! ## The layout axis
+//!
+//! A desc whose `layout` is `None` builds against wgpu's **derived** layout —
+//! the bind-group layout deduced from the bindings each entry point statically
+//! uses. That is the right default, and it is also why a family of programs
+//! specialised from one source needs the explicit axis: a specialisation that
+//! stops reading a binding derives a *different* layout, and a bind group
+//! built against one sibling's layout no longer fits the other. Naming one
+//! explicit `wgpu::PipelineLayout` on every member keeps their bind groups
+//! interchangeable. The layout is a reference-counted handle compared by
+//! identity (wgpu's own `Eq`/`Hash` on it), so two descs naming the same
+//! layout object share the field and two structurally equal but distinct
+//! layout objects do not — which is exactly when wgpu would treat their bind
+//! groups as incompatible too.
+//!
+//! The first axis is the whole *program*, not just the [`ShaderId`], because a
+//! variant that reused one module under a different entry point or vertex
+//! layout would otherwise share a key with its sibling and silently get the
+//! wrong pipeline. Interning the program tuple makes those distinct variants,
+//! which is what Impeller's per-pipeline-type maps achieve structurally.
+//!
+//! A field whose table overflows its width (or a `sample_count` that is not a
+//! power of two, which wgpu would reject anyway) yields no key: that request
+//! falls back to an uncached compile rather than risking a wrong hit. It takes
+//! thousands of distinct blend states to get there, so it is a safety net, not
+//! a path.
+//!
+//! ## The warm-up worker
+//!
+//! One worker at a time, spawned on demand and **exiting when the queue
+//! drains** rather than parking: a surface reinstall calls `warm_up` again,
+//! and the choice keeps a long-lived cache from holding an idle thread (and a
+//! device clone) for the process lifetime. The liveness flag is set and
+//! cleared inside the same critical section that enqueues jobs and claims
+//! them, so a worker on its way out can never be mistaken for one that will
+//! still pick up the job just queued.
+//!
+//! A compile that unwinds marks its variant `JobState::Failed` instead of
+//! leaving it claimable-but-unreachable: the queue entry is already spent, so
+//! a `Pending` job nobody re-queues is a job the worker can never build again
+//! and `queued_variants` would count forever. `Failed` is terminal for the
+//! *queue* only — the next [`PipelineCache::get_or_create`] for that variant
+//! rebuilds it, and a second failure unwinds into that caller rather than
+//! parking it on a build that will never publish. The worker catches the
+//! unwind so one bad variant costs its own pipeline and not the rest of the
+//! queue; an inline build does not, because there the requester is the right
+//! place for the failure to land.
+//!
+//! ## Waiting for the warm-up
+//!
+//! [`PipelineCache::warm_up_done`] reports whether every listed variant has
+//! settled — built, or failed and left to its next request — and
+//! [`PipelineCache::wait_warm_up`] blocks until it has or a timeout passes. A
+//! wait parks on the same condition variable a request for a `Building`
+//! variant does, so it compiles nothing itself and steals nothing: the worker
+//! keeps draining at its own pace. A cache that is shutting down with work
+//! still pending can never settle, so a wait there returns at once rather than
+//! sitting out its timeout.
+//!
+//! ## Shader modules
+//!
+//! A pipeline names its program by [`ShaderId`], and the [`ShaderLibrary`]
+//! creates that id's `wgpu::ShaderModule` on first use (see
+//! [`crate::shader`]): the first build of any variant over a program creates
+//! its module on the building thread — the warm-up worker for a listed
+//! variant, the render thread for a stolen or unlisted one — and a build whose
+//! module another thread is creating waits for it. A module is created once.
+//!
+//! [`PipelineCache::warm_up_shaders`] starts that creation ahead of the first
+//! request, for the few modules the first frame after an install is known to
+//! draw with: one worker can create them only one after another, while module
+//! creation is wgpu's parse and validation of the WGSL — CPU work that runs in
+//! parallel, unlike pipeline builds behind one driver cache — so a small pool
+//! of short-lived threads creates them side by side and every later request
+//! finds the module built or in flight. The pool's threads hold a device
+//! clone, so [`PipelineCache::shutdown`] joins them too.
+//!
+//! ## Persisted driver cache
+//!
+//! A [`wgpu::PipelineCache`] — Vulkan-only, seeded from a shell-persisted blob
+//! validated by [`crate::pipeline_cache`] — can be handed to
+//! [`PipelineCache::new`]. Every pipeline built here is then created against
+//! it, so a warm start reuses the driver's previously compiled machine code.
+//! On Metal/DX12 the feature does not exist and `None` is passed; nothing else
+//! changes.
+
+use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use web_time::Duration;
+
+use crate::shader::{ShaderId, ShaderLibrary};
+
+/// Width of the packed key's program field.
+const PROGRAM_BITS: u32 = 16;
+/// Width of the packed key's color-format field.
+const FORMAT_BITS: u32 = 12;
+/// Width of the packed key's blend-state field.
+const BLEND_BITS: u32 = 12;
+/// Width of the packed key's depth/stencil field.
+const DEPTH_BITS: u32 = 12;
+/// Width of the packed key's `log2(sample_count)` field.
+const SAMPLE_BITS: u32 = 4;
+/// Width of the packed key's pipeline-layout field.
+const LAYOUT_BITS: u32 = 8;
+
+const PROGRAM_SHIFT: u32 = 0;
+const FORMAT_SHIFT: u32 = PROGRAM_SHIFT + PROGRAM_BITS;
+const BLEND_SHIFT: u32 = FORMAT_SHIFT + FORMAT_BITS;
+const DEPTH_SHIFT: u32 = BLEND_SHIFT + BLEND_BITS;
+const SAMPLE_SHIFT: u32 = DEPTH_SHIFT + DEPTH_BITS;
+const LAYOUT_SHIFT: u32 = SAMPLE_SHIFT + SAMPLE_BITS;
+
+const _: () = assert!(
+    LAYOUT_SHIFT + LAYOUT_BITS <= u64::BITS,
+    "the packed variant key must fit one u64",
+);
+
+/// One vertex buffer's layout, owned so a [`RenderPipelineDesc`] can be stored,
+/// cloned, hashed and sent to the warm-up worker.
+///
+/// The borrowed `wgpu::VertexBufferLayout` this converts to
+/// ([`VertexLayout::as_wgpu`]) is built only for the duration of the
+/// `create_render_pipeline` call.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct VertexLayout {
+    /// Stride in bytes between consecutive elements.
+    pub array_stride: wgpu::BufferAddress,
+    /// Whether the buffer steps per vertex or per instance.
+    pub step_mode: wgpu::VertexStepMode,
+    /// The attributes making up one element.
+    pub attributes: Vec<wgpu::VertexAttribute>,
+}
+
+impl VertexLayout {
+    /// A layout stepped per vertex (the common case) over `attributes`.
+    #[must_use]
+    pub fn per_vertex(
+        array_stride: wgpu::BufferAddress,
+        attributes: Vec<wgpu::VertexAttribute>,
+    ) -> Self {
+        Self {
+            array_stride,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes,
+        }
+    }
+
+    /// The borrowed wgpu view of this layout.
+    #[must_use]
+    pub fn as_wgpu(&self) -> wgpu::VertexBufferLayout<'_> {
+        wgpu::VertexBufferLayout {
+            array_stride: self.array_stride,
+            step_mode: self.step_mode,
+            attributes: &self.attributes,
+        }
+    }
+}
+
+/// One render-pipeline variant, as a plain hashable value.
+///
+/// Build the descs an app needs at start-up, hand them to
+/// [`PipelineCache::warm_up`], and keep them around: a per-frame
+/// [`PipelineCache::get_or_create`] takes one by reference and never allocates
+/// on a hit.
+///
+/// The pipeline's bind-group layout is wgpu's **default layout**, deduced
+/// from the shader module, unless [`Self::layout`] names an explicit one —
+/// see the module docs' *The layout axis* for when a variant set needs that.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RenderPipelineDesc {
+    /// The module holding both entry points, from the cache's own library.
+    pub shader: ShaderId,
+    /// Vertex entry point name.
+    pub vs: Cow<'static, str>,
+    /// Fragment entry point name.
+    pub fs: Cow<'static, str>,
+    /// Vertex buffer layouts, in bind order. Empty for a shader that
+    /// generates its own vertices (a fullscreen triangle).
+    pub vertex_layouts: Vec<VertexLayout>,
+    /// Color blending, or `None` for an opaque write.
+    pub blend: Option<wgpu::BlendState>,
+    /// Color target format.
+    pub format: wgpu::TextureFormat,
+    /// MSAA sample count; must be a power of two, `1` for no MSAA.
+    pub sample_count: u32,
+    /// Depth/stencil state, or `None` for a color-only pass.
+    pub depth: Option<wgpu::DepthStencilState>,
+    /// Primitive topology. Strip topologies here are non-indexed only: the
+    /// desc carries no `strip_index_format`.
+    pub topology: wgpu::PrimitiveTopology,
+    /// An explicit pipeline layout, or `None` for wgpu's layout derived from
+    /// the shader module.
+    ///
+    /// Set it when several programs must accept the same bind groups even
+    /// though they do not all read every binding (see the module docs' *The
+    /// layout axis*). Compared and hashed by handle identity.
+    pub layout: Option<wgpu::PipelineLayout>,
+}
+
+impl RenderPipelineDesc {
+    /// A minimal opaque variant: no vertex buffers, no blending, no depth,
+    /// `sample_count: 1`, triangle list. Set the axes that differ with struct
+    /// update syntax.
+    #[must_use]
+    pub fn new(
+        shader: ShaderId,
+        vs: impl Into<Cow<'static, str>>,
+        fs: impl Into<Cow<'static, str>>,
+        format: wgpu::TextureFormat,
+    ) -> Self {
+        Self {
+            shader,
+            vs: vs.into(),
+            fs: fs.into(),
+            vertex_layouts: Vec::new(),
+            blend: None,
+            format,
+            sample_count: 1,
+            depth: None,
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            layout: None,
+        }
+    }
+}
+
+/// The part of a desc that identifies the *program*: everything the packed
+/// key's first field stands for.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ProgramKey {
+    shader: ShaderId,
+    vs: Cow<'static, str>,
+    fs: Cow<'static, str>,
+    vertex_layouts: Vec<VertexLayout>,
+    topology: wgpu::PrimitiveTopology,
+}
+
+impl ProgramKey {
+    fn of(desc: &RenderPipelineDesc) -> Self {
+        Self {
+            shader: desc.shader,
+            vs: desc.vs.clone(),
+            fs: desc.fs.clone(),
+            vertex_layouts: desc.vertex_layouts.clone(),
+            topology: desc.topology,
+        }
+    }
+
+    /// Whether `desc` names this same program, without building a `ProgramKey`
+    /// (and therefore without allocating) — the per-request hot path.
+    fn matches(&self, desc: &RenderPipelineDesc) -> bool {
+        self.shader == desc.shader
+            && self.vs == desc.vs
+            && self.fs == desc.fs
+            && self.topology == desc.topology
+            && self.vertex_layouts == desc.vertex_layouts
+    }
+}
+
+/// Assigns each distinct value of one key axis a dense index.
+///
+/// `None` is returned once the assigned indices would no longer fit the axis's
+/// bit field; the caller then treats the whole key as unavailable.
+#[derive(Debug)]
+struct AxisTable<K> {
+    index: HashMap<K, u64>,
+    bits: u32,
+}
+
+impl<K: std::hash::Hash + Eq + Clone> AxisTable<K> {
+    fn new(bits: u32) -> Self {
+        Self {
+            index: HashMap::new(),
+            bits,
+        }
+    }
+
+    fn intern(&mut self, value: &K) -> Option<u64> {
+        if let Some(existing) = self.index.get(value) {
+            return Some(*existing);
+        }
+        let next = self.index.len() as u64;
+        if next >= 1 << self.bits {
+            return None;
+        }
+        self.index.insert(value.clone(), next);
+        Some(next)
+    }
+}
+
+/// The program axis's own table: a hash index onto stored [`ProgramKey`]s, so
+/// a repeat lookup compares rather than clones.
+#[derive(Debug, Default)]
+struct ProgramTable {
+    /// Program-tuple hash → the indices assigned to programs with that hash.
+    /// A chain longer than one entry means a genuine hash collision, which the
+    /// stored key comparison then resolves.
+    by_hash: HashMap<u64, Vec<u64>>,
+    entries: Vec<ProgramKey>,
+}
+
+impl ProgramTable {
+    fn intern(&mut self, desc: &RenderPipelineDesc) -> Option<u64> {
+        let hash = program_hash(desc);
+        let chain = self.by_hash.entry(hash).or_default();
+        for &candidate in chain.iter() {
+            if self.entries[candidate as usize].matches(desc) {
+                return Some(candidate);
+            }
+        }
+        let next = self.entries.len() as u64;
+        if next >= 1 << PROGRAM_BITS {
+            return None;
+        }
+        chain.push(next);
+        self.entries.push(ProgramKey::of(desc));
+        Some(next)
+    }
+}
+
+/// Hashes a desc's program fields without building a [`ProgramKey`].
+fn program_hash(desc: &RenderPipelineDesc) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    desc.shader.hash(&mut hasher);
+    desc.vs.hash(&mut hasher);
+    desc.fs.hash(&mut hasher);
+    desc.vertex_layouts.hash(&mut hasher);
+    desc.topology.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Packs a [`RenderPipelineDesc`] into the `u64` variant key.
+#[derive(Debug)]
+struct KeyPacker {
+    programs: ProgramTable,
+    formats: AxisTable<wgpu::TextureFormat>,
+    blends: AxisTable<Option<wgpu::BlendState>>,
+    depths: AxisTable<Option<wgpu::DepthStencilState>>,
+    layouts: AxisTable<Option<wgpu::PipelineLayout>>,
+}
+
+impl Default for KeyPacker {
+    fn default() -> Self {
+        Self {
+            programs: ProgramTable::default(),
+            formats: AxisTable::new(FORMAT_BITS),
+            blends: AxisTable::new(BLEND_BITS),
+            depths: AxisTable::new(DEPTH_BITS),
+            layouts: AxisTable::new(LAYOUT_BITS),
+        }
+    }
+}
+
+impl KeyPacker {
+    /// The variant key for `desc`, or `None` if an axis cannot be represented
+    /// (an unusable `sample_count`, or an exhausted interning table).
+    fn key_for(&mut self, desc: &RenderPipelineDesc) -> Option<u64> {
+        // Resolved first so a rejected sample count never leaves a fresh entry
+        // behind in a table.
+        let sample = sample_field(desc.sample_count)?;
+        let program = self.programs.intern(desc)?;
+        let format = self.formats.intern(&desc.format)?;
+        let blend = self.blends.intern(&desc.blend)?;
+        let depth = self.depths.intern(&desc.depth)?;
+        let layout = self.layouts.intern(&desc.layout)?;
+        Some(
+            (program << PROGRAM_SHIFT)
+                | (format << FORMAT_SHIFT)
+                | (blend << BLEND_SHIFT)
+                | (depth << DEPTH_SHIFT)
+                | (sample << SAMPLE_SHIFT)
+                | (layout << LAYOUT_SHIFT),
+        )
+    }
+}
+
+/// `log2(sample_count)`, or `None` for a count wgpu could not use anyway.
+fn sample_field(sample_count: u32) -> Option<u64> {
+    if sample_count == 0 || !sample_count.is_power_of_two() {
+        return None;
+    }
+    let field = u64::from(sample_count.trailing_zeros());
+    (field < 1 << SAMPLE_BITS).then_some(field)
+}
+
+/// Where a queued warm-up job has got to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JobState {
+    /// Listed by `warm_up`, nobody has started it.
+    Pending,
+    /// Some thread is compiling it right now.
+    Building,
+    /// Built; the pipeline is in `Inner::built`.
+    Done,
+    /// A compile of this variant unwound. Terminal as far as the warm-up
+    /// queue is concerned — its place in the queue is spent, so no worker
+    /// will claim it again — but a later request rebuilds it inline.
+    Failed,
+}
+
+/// One warm-up job: the variant to build and how far along it is.
+#[derive(Debug)]
+struct Job {
+    desc: RenderPipelineDesc,
+    state: JobState,
+}
+
+/// Everything both the render thread and the warm-up worker touch.
+#[derive(Debug)]
+struct Inner<P> {
+    built: HashMap<u64, Arc<P>>,
+    jobs: HashMap<u64, Job>,
+    /// Keys in the order `warm_up` listed them. Entries whose job was stolen
+    /// or finished are skipped when popped.
+    queue: VecDeque<u64>,
+    /// How many compiles have actually run — the "compiled once" evidence.
+    compiles: u64,
+    /// Whether a warm-up worker is draining `queue` right now. Only ever
+    /// written while the lock is held, which is what makes "one worker" a
+    /// fact rather than a race: see the module docs.
+    worker_live: bool,
+    /// Set once the cache is shutting down; a worker claims nothing more, so
+    /// teardown waits for at most the compile already in flight.
+    shutdown: bool,
+    /// Bumped every time liveness is claimed, so a departing worker can tell
+    /// whether the flag it is about to clear is still its own.
+    worker_epoch: u64,
+    /// How many warm-up jobs the worker has finished building.
+    warm_finished: u64,
+}
+
+impl<P> Default for Inner<P> {
+    fn default() -> Self {
+        Self {
+            built: HashMap::new(),
+            jobs: HashMap::new(),
+            queue: VecDeque::new(),
+            compiles: 0,
+            worker_live: false,
+            shutdown: false,
+            worker_epoch: 0,
+            warm_finished: 0,
+        }
+    }
+}
+
+impl<P> Inner<P> {
+    /// Claims the next still-pending job, marking it `Building`.
+    ///
+    /// Returning `None` also clears `worker_live`, in this same critical
+    /// section: a caller that enqueues after this point sees no live worker
+    /// and spawns one, so the job it just listed cannot fall between the
+    /// worker's last look at the queue and its exit.
+    fn claim_next_pending(&mut self) -> Option<(u64, RenderPipelineDesc)> {
+        while !self.shutdown
+            && let Some(key) = self.queue.pop_front()
+        {
+            if let Some(job) = self.jobs.get_mut(&key)
+                && job.state == JobState::Pending
+            {
+                job.state = JobState::Building;
+                return Some((key, job.desc.clone()));
+            }
+        }
+        self.worker_live = false;
+        None
+    }
+
+    /// Whether every job is settled: built, or failed and left to be rebuilt
+    /// on request. A pending or in-flight job keeps the warm-up unfinished.
+    fn warm_up_settled(&self) -> bool {
+        !self
+            .jobs
+            .values()
+            .any(|job| matches!(job.state, JobState::Pending | JobState::Building))
+    }
+
+    /// Whether waiting can no longer change [`Self::warm_up_settled`]: the
+    /// cache is shutting down, so no worker claims the jobs still pending, and
+    /// nothing is mid-build to publish.
+    fn warm_up_stalled(&self) -> bool {
+        self.shutdown
+            && !self
+                .jobs
+                .values()
+                .any(|job| job.state == JobState::Building)
+    }
+}
+
+/// The shared half of a cache: state plus the condition variable a waiter
+/// blocks on while another thread builds the variant it wants.
+#[derive(Debug)]
+struct Shared<P> {
+    inner: Mutex<Inner<P>>,
+    built: Condvar,
+}
+
+impl<P> Default for Shared<P> {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(Inner::default()),
+            built: Condvar::new(),
+        }
+    }
+}
+
+/// Locks a mutex, adopting the guard even if a previous holder panicked — this
+/// cache never leaves inconsistent state behind, and a poisoned lock must not
+/// turn a warm-up hiccup into a crash.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Holds a job `Building` for the duration of one compile, and marks it
+/// [`JobState::Failed`] if that compile unwinds — without this a panicking
+/// builder would leave every waiter blocked on a build that will never finish.
+///
+/// `Failed` rather than `Pending` because the job's place in the warm-up queue
+/// is already spent: a `Pending` entry no worker can reach is a phantom that
+/// `queued_variants` would report for the process lifetime. The failure stays
+/// visible to the next requester, which rebuilds the variant inline.
+struct BuildGuard<'a, P> {
+    shared: &'a Shared<P>,
+    key: u64,
+    armed: bool,
+}
+
+impl<'a, P> BuildGuard<'a, P> {
+    fn new(shared: &'a Shared<P>, key: u64) -> Self {
+        Self {
+            shared,
+            key,
+            armed: true,
+        }
+    }
+
+    /// Publishes the finished pipeline, marks the job done, and wakes waiters.
+    fn publish(mut self, pipeline: Arc<P>) {
+        self.armed = false;
+        let mut inner = lock(&self.shared.inner);
+        inner.built.insert(self.key, pipeline);
+        if let Some(job) = inner.jobs.get_mut(&self.key) {
+            job.state = JobState::Done;
+        }
+        inner.compiles += 1;
+        drop(inner);
+        self.shared.built.notify_all();
+    }
+}
+
+/// Clears the worker-liveness flag if a drain leaves by any route other than
+/// the ordinary "queue empty" one, which clears it under the lock itself.
+///
+/// The epoch check is what stops a departing worker from clearing liveness
+/// that a *newer* worker has since claimed — without it, an abnormal exit
+/// racing a fresh `warm_up` could leave two workers on one queue.
+struct LiveWorkerGuard<'a, P> {
+    shared: &'a Shared<P>,
+    epoch: u64,
+}
+
+impl<P> Drop for LiveWorkerGuard<'_, P> {
+    fn drop(&mut self) {
+        let mut inner = lock(&self.shared.inner);
+        if inner.worker_epoch == self.epoch {
+            inner.worker_live = false;
+        }
+    }
+}
+
+impl<P> Drop for BuildGuard<'_, P> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut inner = lock(&self.shared.inner);
+        if let Some(job) = inner.jobs.get_mut(&self.key) {
+            job.state = JobState::Failed;
+        }
+        drop(inner);
+        self.shared.built.notify_all();
+    }
+}
+
+/// The device-free half of [`PipelineCache`]: key packing, the warm-up queue,
+/// eager stealing, and the render-thread mirror.
+///
+/// Generic over the compiled artifact so all of that policy is exercised by
+/// host tests with a fake compile function, with no GPU in the loop — the same
+/// split [`crate::caps::TierCaps`] uses to keep tier decisions testable.
+#[derive(Debug)]
+struct VariantCache<P> {
+    shared: Arc<Shared<P>>,
+    /// Render-thread mirror of `Shared::built`, so a steady-state hit takes no
+    /// lock and can hand out a plain reference.
+    local: HashMap<u64, Arc<P>>,
+    /// The most recent uncached compile (see the key-exhaustion note on the
+    /// module docs). Held only so a reference can be returned.
+    overflow: Option<Arc<P>>,
+    keys: KeyPacker,
+    warned_key_space: bool,
+    /// The one warm-up worker, kept so [`VariantCache::shutdown`] can join it.
+    worker: Option<std::thread::JoinHandle<()>>,
+    /// Time the render thread spent inside `resolve` since it was last taken:
+    /// waiting on a `Building` variant, or stealing and building a `Pending`
+    /// or unlisted one inline.
+    #[cfg(feature = "perf-trace")]
+    resolve_wait: web_time::Duration,
+}
+
+impl<P> Default for VariantCache<P> {
+    fn default() -> Self {
+        Self {
+            shared: Arc::new(Shared::default()),
+            local: HashMap::new(),
+            overflow: None,
+            keys: KeyPacker::default(),
+            warned_key_space: false,
+            worker: None,
+            #[cfg(feature = "perf-trace")]
+            resolve_wait: web_time::Duration::ZERO,
+        }
+    }
+}
+
+impl<P> Drop for VariantCache<P> {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl<P> VariantCache<P> {
+    /// A handle on the shared state, for a warm-up worker.
+    fn shared(&self) -> Arc<Shared<P>> {
+        Arc::clone(&self.shared)
+    }
+
+    /// Whether [`Self::shutdown`] has run: the cache starts no thread again.
+    fn is_shut_down(&self) -> bool {
+        lock(&self.shared.inner).shutdown
+    }
+
+    /// Returns the variant for `desc`, compiling it at most once.
+    fn get_or_create<F>(&mut self, desc: &RenderPipelineDesc, compile: F) -> &P
+    where
+        F: Fn(&RenderPipelineDesc) -> P,
+    {
+        let Some(key) = self.keys.key_for(desc) else {
+            if !self.warned_key_space {
+                self.warned_key_space = true;
+                log::error!(
+                    "frust-gpu: pipeline variant key space exhausted (or an unusable \
+                     sample_count {}); this variant is compiled per request instead of cached",
+                    desc.sample_count
+                );
+            }
+            self.overflow = Some(Arc::new(compile(desc)));
+            return self
+                .overflow
+                .as_deref()
+                .expect("the uncached variant was just stored");
+        };
+
+        if !self.local.contains_key(&key) {
+            #[cfg(feature = "perf-trace")]
+            let started = web_time::Instant::now();
+            let built = self.resolve(key, desc, &compile);
+            #[cfg(feature = "perf-trace")]
+            {
+                self.resolve_wait = self.resolve_wait.saturating_add(started.elapsed());
+            }
+            self.local.insert(key, built);
+        }
+        &self.local[&key]
+    }
+
+    /// The shared-state half of `get_or_create`: hit, steal, wait, or build.
+    fn resolve<F>(&self, key: u64, desc: &RenderPipelineDesc, compile: &F) -> Arc<P>
+    where
+        F: Fn(&RenderPipelineDesc) -> P,
+    {
+        let mut inner = lock(&self.shared.inner);
+        loop {
+            if let Some(built) = inner.built.get(&key) {
+                return Arc::clone(built);
+            }
+            match inner.jobs.get(&key).map(|job| job.state) {
+                // The warm-up worker holds this job: wait for its result
+                // rather than compiling a second copy of the same variant.
+                Some(JobState::Building) => {
+                    inner = self
+                        .shared
+                        .built
+                        .wait(inner)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+                // Queued but unstarted — steal it and build it inline. Same
+                // for a variant whose last compile unwound: the queue will
+                // never come back to it, so the requester rebuilds it here
+                // (and eats the failure itself if it unwinds again).
+                Some(JobState::Pending | JobState::Failed) => {
+                    if let Some(job) = inner.jobs.get_mut(&key) {
+                        job.state = JobState::Building;
+                    }
+                    drop(inner);
+                    return self.build(key, desc, compile);
+                }
+                // Never queued (or queued, finished, and since dropped):
+                // record it as in-flight so a concurrent request waits.
+                Some(JobState::Done) | None => {
+                    inner.jobs.insert(
+                        key,
+                        Job {
+                            desc: desc.clone(),
+                            state: JobState::Building,
+                        },
+                    );
+                    drop(inner);
+                    return self.build(key, desc, compile);
+                }
+            }
+        }
+    }
+
+    /// Runs one compile for an already-claimed (`Building`) job and publishes it.
+    fn build<F>(&self, key: u64, desc: &RenderPipelineDesc, compile: &F) -> Arc<P>
+    where
+        F: Fn(&RenderPipelineDesc) -> P,
+    {
+        let guard = BuildGuard::new(&self.shared, key);
+        let pipeline = Arc::new(compile(desc));
+        guard.publish(Arc::clone(&pipeline));
+        pipeline
+    }
+
+    /// Records `descs` as warm-up jobs, skipping any variant already built or
+    /// already queued. Compiles nothing itself.
+    ///
+    /// Returns whether the caller must start a worker: `true` only when there
+    /// is pending work and no live worker to take it, in which case the
+    /// liveness flag is claimed here, under the same lock that queued the
+    /// jobs. A cache that is shutting down never asks for one.
+    fn enqueue(&mut self, descs: &[RenderPipelineDesc]) -> bool {
+        let mut inner = lock(&self.shared.inner);
+        for desc in descs {
+            let Some(key) = self.keys.key_for(desc) else {
+                log::error!(
+                    "frust-gpu: warm-up variant has no representable key (sample_count {}); \
+                     it will be compiled on first use instead",
+                    desc.sample_count
+                );
+                continue;
+            };
+            if inner.built.contains_key(&key) || inner.jobs.contains_key(&key) {
+                continue;
+            }
+            inner.jobs.insert(
+                key,
+                Job {
+                    desc: desc.clone(),
+                    state: JobState::Pending,
+                },
+            );
+            inner.queue.push_back(key);
+        }
+        if inner.shutdown || inner.worker_live || inner.queue.is_empty() {
+            return false;
+        }
+        inner.worker_live = true;
+        inner.worker_epoch += 1;
+        true
+    }
+
+    /// Builds every still-pending queued job. This is the warm-up worker's
+    /// whole body; a job the render thread stole in the meantime is skipped.
+    ///
+    /// A compile that unwinds is caught here rather than tearing the worker
+    /// down with the rest of the queue unbuilt: [`BuildGuard`] has already
+    /// marked that one variant failed, and the drain moves on.
+    fn drain_queue<F>(shared: &Arc<Shared<P>>, compile: F)
+    where
+        F: Fn(&RenderPipelineDesc) -> P,
+    {
+        let _live = LiveWorkerGuard {
+            shared,
+            epoch: lock(&shared.inner).worker_epoch,
+        };
+        loop {
+            let claimed = lock(&shared.inner).claim_next_pending();
+            let Some((key, desc)) = claimed else {
+                return;
+            };
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let guard = BuildGuard::new(shared, key);
+                guard.publish(Arc::new(compile(&desc)));
+            }));
+            if built.is_ok() {
+                lock(&shared.inner).warm_finished += 1;
+            }
+            if built.is_err() {
+                log::error!(
+                    "frust-gpu: a warm-up compile panicked; that variant is left to be \
+                     rebuilt on request and the rest of the queue continues"
+                );
+            }
+        }
+    }
+
+    /// Queues `descs` and makes sure exactly one worker is draining them.
+    ///
+    /// `make_compile` is called once per thread that needs one — the worker,
+    /// or the calling thread when the spawn fails and the queue has to be
+    /// drained inline rather than silently not warmed at all.
+    fn warm_up<F>(&mut self, descs: &[RenderPipelineDesc], make_compile: impl Fn() -> F)
+    where
+        P: Send + Sync + 'static,
+        F: Fn(&RenderPipelineDesc) -> P + Send + 'static,
+    {
+        if !self.enqueue(descs) {
+            return;
+        }
+        // The previous worker has already cleared the liveness flag and is on
+        // its way out; joining it here is what keeps "no worker outlives the
+        // cache" true of the handle this cache actually holds.
+        self.join_worker();
+
+        let worker_shared = self.shared();
+        let worker_compile = make_compile();
+        let spawned = std::thread::Builder::new()
+            .name("frust-gpu pipeline warm-up".to_string())
+            .spawn(move || VariantCache::drain_queue(&worker_shared, worker_compile));
+        match spawned {
+            Ok(handle) => self.worker = Some(handle),
+            Err(err) => {
+                log::warn!(
+                    "frust-gpu: could not spawn the pipeline warm-up thread ({err}); \
+                     building the listed variants inline"
+                );
+                VariantCache::drain_queue(&self.shared(), make_compile());
+            }
+        }
+    }
+
+    /// Stops the warm-up worker and waits for it, so nothing this cache
+    /// spawned can still be holding the device once it returns.
+    ///
+    /// Idempotent, and terminal: the shutdown flag stays set, so a later
+    /// `warm_up` queues its variants without starting a worker and they are
+    /// built on request instead.
+    fn shutdown(&mut self) {
+        lock(&self.shared.inner).shutdown = true;
+        self.join_worker();
+    }
+
+    /// Joins the worker if one is recorded, reporting a panic that escaped it.
+    fn join_worker(&mut self) {
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            log::error!("frust-gpu: the pipeline warm-up worker panicked");
+        }
+    }
+
+    /// How many compiles have run since this cache was created.
+    fn compiled_variants(&self) -> u64 {
+        lock(&self.shared.inner).compiles
+    }
+
+    /// How many warm-up jobs the worker has finished building.
+    fn warm_up_finished(&self) -> u64 {
+        lock(&self.shared.inner).warm_finished
+    }
+
+    /// Whether every listed warm-up job has settled (see
+    /// [`Inner::warm_up_settled`]).
+    fn warm_up_done(&self) -> bool {
+        lock(&self.shared.inner).warm_up_settled()
+    }
+
+    /// Blocks until the warm-up has settled or `timeout` has passed, and
+    /// returns whether it settled. Builds nothing: the worker, and any
+    /// request already compiling inline, publish the variants it waits for.
+    ///
+    /// Returns at once when the warm-up can no longer settle (a shutdown with
+    /// jobs still pending) as of the call, and immediately with a zero
+    /// `timeout`. Takes `&mut self` only to account the wait under
+    /// `perf-trace`; a shutdown cannot overlap a wait on the same cache.
+    fn wait_warm_up(&mut self, timeout: Duration) -> bool {
+        #[cfg(feature = "perf-trace")]
+        let started = web_time::Instant::now();
+        let inner = lock(&self.shared.inner);
+        let (inner, _) = self
+            .shared
+            .built
+            .wait_timeout_while(inner, timeout, |inner| {
+                !inner.warm_up_settled() && !inner.warm_up_stalled()
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        let settled = inner.warm_up_settled();
+        drop(inner);
+        #[cfg(feature = "perf-trace")]
+        {
+            self.resolve_wait = self.resolve_wait.saturating_add(started.elapsed());
+        }
+        settled
+    }
+
+    /// How many warm-up jobs are still waiting to be built.
+    fn queued_variants(&self) -> usize {
+        let inner = lock(&self.shared.inner);
+        inner
+            .jobs
+            .values()
+            .filter(|job| job.state == JobState::Pending)
+            .count()
+    }
+}
+
+/// The engine's render-pipeline cache.
+///
+/// Owns nothing but policy plus the compiled pipelines: the `wgpu::Device` is
+/// passed per call, and the shader modules come from the shared
+/// [`ShaderLibrary`] handed to [`PipelineCache::new`].
+///
+/// See the module docs for the variant key, the warm-up queue and the
+/// eager-steal rule.
+#[derive(Debug)]
+pub struct PipelineCache {
+    core: VariantCache<wgpu::RenderPipeline>,
+    shaders: Arc<ShaderLibrary>,
+    driver_cache: Option<wgpu::PipelineCache>,
+    /// The threads [`Self::warm_up_shaders`] started, joined by
+    /// [`Self::shutdown`] and on drop.
+    shader_workers: ShaderWorkers,
+}
+
+impl PipelineCache {
+    /// A cache over `shaders`, optionally seeding every pipeline it builds
+    /// from a persisted `driver_cache`.
+    ///
+    /// `driver_cache` is `None` on every backend but Vulkan; see
+    /// [`crate::pipeline_cache`] for how a persisted blob is validated before
+    /// it becomes one.
+    #[must_use]
+    pub fn new(shaders: Arc<ShaderLibrary>, driver_cache: Option<wgpu::PipelineCache>) -> Self {
+        Self {
+            core: VariantCache::default(),
+            shaders,
+            driver_cache,
+            shader_workers: ShaderWorkers::default(),
+        }
+    }
+
+    /// The library this cache resolves [`ShaderId`]s against.
+    #[must_use]
+    pub fn shaders(&self) -> &ShaderLibrary {
+        &self.shaders
+    }
+
+    /// The pipeline for `desc`, compiling it if this is the first request.
+    ///
+    /// A variant queued for the warm-up worker but not yet started is stolen
+    /// and built inline; one the worker is already building is waited for.
+    /// Either way the variant is compiled exactly once.
+    ///
+    /// # Panics
+    ///
+    /// If `desc.shader` was not minted by this cache's [`ShaderLibrary`]. An
+    /// id is opaque and library-scoped, so that is a wiring bug, not a runtime
+    /// condition.
+    pub fn get_or_create(
+        &mut self,
+        device: &wgpu::Device,
+        desc: &RenderPipelineDesc,
+    ) -> &wgpu::RenderPipeline {
+        let shaders = &self.shaders;
+        let driver_cache = self.driver_cache.as_ref();
+        self.core.get_or_create(desc, |desc| {
+            build_render_pipeline(device, shaders, driver_cache, desc)
+        })
+    }
+
+    /// Queues `descs` and builds them on a worker thread.
+    ///
+    /// Call it once the surface (and therefore the device) exists, with every
+    /// variant the app is known to draw. Returns immediately, and the render
+    /// thread never blocks on the worker — a variant it asks for early is
+    /// stolen out of the queue instead.
+    ///
+    /// Safe to call repeatedly: a surface reinstall enqueues its variants
+    /// against the live worker rather than starting a second one, and a call
+    /// whose variants are all built already starts nothing at all.
+    ///
+    /// If the thread cannot be spawned the queue is drained inline instead, so
+    /// warm-up degrades to a synchronous build rather than silently not
+    /// happening.
+    ///
+    /// The worker creates each program's shader module as its first variant
+    /// over that program reaches it, unless [`Self::warm_up_shaders`] or an
+    /// earlier request already has.
+    pub fn warm_up(&mut self, device: &wgpu::Device, descs: &[RenderPipelineDesc]) {
+        let shaders = Arc::clone(&self.shaders);
+        let driver_cache = self.driver_cache.clone();
+        self.core
+            .warm_up(descs, || compiler(device, &shaders, driver_cache.as_ref()));
+    }
+
+    /// Starts creating the shader modules `ids` name on a small pool of
+    /// short-lived threads and returns at once.
+    ///
+    /// Call it at install, before [`Self::warm_up`], with the modules the
+    /// first frame draws with: the pool creates them side by side while the
+    /// render thread finishes its install, and the worker's or the render
+    /// thread's first build over one of them then finds the module built, or
+    /// waits for the pool thread creating it — never creating it twice. A
+    /// module already created, an id listed twice, and an id this cache's
+    /// library did not mint are skipped; everything else stays created on
+    /// first use.
+    ///
+    /// One thread per module, at most one fewer than the machine's available
+    /// parallelism (and at least one), so the calling thread keeps a core.
+    /// The threads exit when the list is done; [`Self::shutdown`] (and drop)
+    /// joins them. If a thread cannot be spawned the modules it would have
+    /// created are left to their first use rather than created inline — the
+    /// call must not put module creation back in front of the caller. After
+    /// [`Self::shutdown`] it starts nothing.
+    pub fn warm_up_shaders(&mut self, device: &wgpu::Device, ids: &[ShaderId]) {
+        self.shader_workers.reap_finished();
+        if self.core.is_shut_down() {
+            return;
+        }
+        let mut pending: Vec<ShaderId> = Vec::with_capacity(ids.len());
+        for id in ids {
+            if self.shaders.name_of(*id).is_some()
+                && !self.shaders.is_compiled(*id)
+                && !pending.contains(id)
+            {
+                pending.push(*id);
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+        let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+        let threads = shader_thread_count(pending.len(), parallelism);
+        let list: Arc<(Vec<ShaderId>, AtomicUsize)> = Arc::new((pending, AtomicUsize::new(0)));
+        for _ in 0..threads {
+            let shaders = Arc::clone(&self.shaders);
+            let device = device.clone();
+            let list = Arc::clone(&list);
+            let spawned = std::thread::Builder::new()
+                .name("frust-gpu shader warm-up".to_string())
+                .spawn(move || {
+                    let (ids, next) = &*list;
+                    while let Some(id) = ids.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        let _module = shaders.module(&device, *id);
+                    }
+                });
+            match spawned {
+                Ok(handle) => self.shader_workers.0.push(handle),
+                Err(err) => {
+                    log::warn!(
+                        "frust-gpu: could not spawn a shader warm-up thread ({err}); the \
+                         modules it would have created are created on first use"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Stops warm-up and joins the worker and any [`Self::warm_up_shaders`]
+    /// thread, so no thread holding a clone of the device outlives this cache.
+    ///
+    /// [`Drop`] calls this; call it explicitly to order the wait before other
+    /// teardown of your own. It is idempotent, and terminal — afterwards
+    /// [`Self::warm_up`] records its variants without starting a worker, and
+    /// they are compiled on first request.
+    pub fn shutdown(&mut self) {
+        self.core.shutdown();
+        self.shader_workers.join_all();
+    }
+
+    /// How many pipelines this cache has actually compiled.
+    #[must_use]
+    pub fn compiled_variants(&self) -> u64 {
+        self.core.compiled_variants()
+    }
+
+    /// How many warm-up variants are still waiting to be built.
+    #[must_use]
+    pub fn queued_variants(&self) -> usize {
+        self.core.queued_variants()
+    }
+
+    /// How many pipelines the warm-up worker has finished building (variants
+    /// the render thread stole or built itself are not counted).
+    #[must_use]
+    pub fn warm_up_finished(&self) -> u64 {
+        self.core.warm_up_finished()
+    }
+
+    /// Whether every variant [`Self::warm_up`] has listed so far is settled —
+    /// built, or failed and left to be rebuilt on its next request.
+    ///
+    /// `true` for a cache that was never asked to warm anything up.
+    #[must_use]
+    pub fn warm_up_done(&self) -> bool {
+        self.core.warm_up_done()
+    }
+
+    /// Blocks the calling thread until the warm-up is done
+    /// ([`Self::warm_up_done`]) or `timeout` has passed, returning whether it
+    /// finished.
+    ///
+    /// Compiles nothing on the calling thread and steals nothing from the
+    /// queue — the worker builds every remaining variant — so it is the
+    /// counterpart of requesting each listed variant through
+    /// [`Self::get_or_create`], which would build the queued ones inline. A
+    /// zero `timeout` is a non-blocking [`Self::warm_up_done`]. After
+    /// [`Self::shutdown`] with variants still queued nothing will ever build
+    /// them, so it returns `false` at once instead of waiting out `timeout`.
+    ///
+    /// Under `perf-trace` the time spent here counts toward
+    /// [`Self::take_resolve_wait`], beside the waits `get_or_create` makes.
+    pub fn wait_warm_up(&mut self, timeout: Duration) -> bool {
+        self.core.wait_warm_up(timeout)
+    }
+
+    /// Takes the time [`Self::get_or_create`] has spent resolving variants it
+    /// did not already hold — waiting for the worker's in-flight build, or
+    /// building a pending/unlisted one inline — since the last call, plus any
+    /// time spent in [`Self::wait_warm_up`].
+    ///
+    /// `perf-trace`-only, with the startup span it feeds.
+    #[cfg(feature = "perf-trace")]
+    pub fn take_resolve_wait(&mut self) -> web_time::Duration {
+        std::mem::take(&mut self.core.resolve_wait)
+    }
+}
+
+/// How many threads [`PipelineCache::warm_up_shaders`] creates `modules`
+/// modules with on a machine offering `parallelism` threads: one per module,
+/// at most one fewer than `parallelism` so the calling thread keeps a core,
+/// and at least one.
+fn shader_thread_count(modules: usize, parallelism: usize) -> usize {
+    modules.min(parallelism.saturating_sub(1)).max(1)
+}
+
+/// The threads [`PipelineCache::warm_up_shaders`] started. Each holds a device
+/// clone, so they are joined by [`PipelineCache::shutdown`] and on drop; a
+/// finished one is reaped by the next `warm_up_shaders` call.
+#[derive(Debug, Default)]
+struct ShaderWorkers(Vec<std::thread::JoinHandle<()>>);
+
+impl ShaderWorkers {
+    /// Joins the threads that have already exited, keeping the live ones.
+    fn reap_finished(&mut self) {
+        let (finished, live): (Vec<_>, Vec<_>) = std::mem::take(&mut self.0)
+            .into_iter()
+            .partition(std::thread::JoinHandle::is_finished);
+        self.0 = live;
+        Self::join(finished);
+    }
+
+    /// Joins every thread, waiting for the ones still creating a module.
+    fn join_all(&mut self) {
+        Self::join(std::mem::take(&mut self.0));
+    }
+
+    fn join(handles: Vec<std::thread::JoinHandle<()>>) {
+        for handle in handles {
+            if handle.join().is_err() {
+                log::error!(
+                    "frust-gpu: a shader warm-up thread panicked; the module it was creating \
+                     is created on its next request"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for ShaderWorkers {
+    fn drop(&mut self) {
+        self.join_all();
+    }
+}
+
+/// A self-contained compile function for a worker thread: it owns clones of
+/// the device, library and driver cache, all of which are `Arc`-backed
+/// handles.
+fn compiler(
+    device: &wgpu::Device,
+    shaders: &Arc<ShaderLibrary>,
+    driver_cache: Option<&wgpu::PipelineCache>,
+) -> impl Fn(&RenderPipelineDesc) -> wgpu::RenderPipeline + Send + 'static + use<> {
+    let device = device.clone();
+    let shaders = Arc::clone(shaders);
+    let driver_cache = driver_cache.cloned();
+    move |desc| build_render_pipeline(&device, &shaders, driver_cache.as_ref(), desc)
+}
+
+/// Creates one `wgpu::RenderPipeline` from a desc — the only place in this
+/// module that touches the device.
+fn build_render_pipeline(
+    device: &wgpu::Device,
+    shaders: &ShaderLibrary,
+    driver_cache: Option<&wgpu::PipelineCache>,
+    desc: &RenderPipelineDesc,
+) -> wgpu::RenderPipeline {
+    let name = shaders.name_of(desc.shader).unwrap_or("<unknown shader>");
+    // Created here on first use — or waited for, if another thread is
+    // creating it right now (see the module docs' *Shader modules*).
+    let module = shaders
+        .module(device, desc.shader)
+        .expect("a RenderPipelineDesc's ShaderId must come from this cache's ShaderLibrary");
+    // `wgpu::VertexState::buffers` is a slice of `Option`s: a `None` slot
+    // declares a vertex-buffer index the pipeline leaves unbound. Every layout
+    // this cache carries is used, so each one is wrapped in `Some` and no gap
+    // is ever produced.
+    let layouts: Vec<Option<wgpu::VertexBufferLayout<'_>>> = desc
+        .vertex_layouts
+        .iter()
+        .map(|layout| Some(VertexLayout::as_wgpu(layout)))
+        .collect();
+    let label = format!(
+        "frust-gpu pipeline: {name} [{:?}, msaa x{}]",
+        desc.format, desc.sample_count
+    );
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(&label),
+        // `None` asks wgpu to derive the layout from the module — see the
+        // module docs' *The layout axis* for when a desc names one instead.
+        layout: desc.layout.as_ref(),
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some(desc.vs.as_ref()),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &layouts,
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: desc.topology,
+            ..Default::default()
+        },
+        depth_stencil: desc.depth.clone(),
+        multisample: wgpu::MultisampleState {
+            count: desc.sample_count,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        fragment: Some(wgpu::FragmentState {
+            module,
+            entry_point: Some(desc.fs.as_ref()),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: desc.format,
+                blend: desc.blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: driver_cache,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    /// The layout axis holds `1 << LAYOUT_BITS` distinct layouts and no more:
+    /// the next one is refused rather than aliasing an index, a layout already
+    /// interned keeps answering, and a refusal leaves the table unchanged.
+    #[test]
+    fn the_layout_axis_refuses_a_layout_past_its_bit_field() {
+        let mut layouts: AxisTable<u32> = AxisTable::new(LAYOUT_BITS);
+        let capacity = 1_u32 << LAYOUT_BITS;
+        for layout in 0..capacity {
+            assert_eq!(layouts.intern(&layout), Some(u64::from(layout)));
+        }
+        assert_eq!(layouts.intern(&capacity), None, "the table is full");
+        assert_eq!(layouts.intern(&(capacity + 1)), None);
+        assert_eq!(
+            layouts.index.len(),
+            capacity as usize,
+            "a refusal adds nothing"
+        );
+        assert_eq!(
+            layouts.intern(&7),
+            Some(7),
+            "an interned layout still answers"
+        );
+    }
+
+    /// Stands in for a `wgpu::RenderPipeline` so the queue/steal policy runs
+    /// with no device: it records which variant it was built from.
+    #[derive(Debug, PartialEq, Eq)]
+    struct FakePipeline {
+        sample_count: u32,
+        serial: u64,
+    }
+
+    /// A compile function that counts its calls, so "compiled once" is an
+    /// assertion rather than an inference.
+    #[derive(Default)]
+    struct Counter(AtomicU64);
+
+    impl Counter {
+        fn compile(&self, desc: &RenderPipelineDesc) -> FakePipeline {
+            let serial = self.0.fetch_add(1, Ordering::SeqCst);
+            FakePipeline {
+                sample_count: desc.sample_count,
+                serial,
+            }
+        }
+
+        fn count(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn desc() -> RenderPipelineDesc {
+        RenderPipelineDesc::new(
+            ShaderId::from_raw(0),
+            "vs_main",
+            "fs_main",
+            wgpu::TextureFormat::Rgba8Unorm,
+        )
+    }
+
+    #[test]
+    fn a_repeated_request_compiles_once() {
+        let mut cache = VariantCache::<FakePipeline>::default();
+        let counter = Counter::default();
+        let desc = desc();
+
+        let first = cache.get_or_create(&desc, |d| counter.compile(d)).serial;
+        for _ in 0..8 {
+            let again = cache.get_or_create(&desc, |d| counter.compile(d)).serial;
+            assert_eq!(again, first, "every repeat must return the same pipeline");
+        }
+        assert_eq!(counter.count(), 1);
+        assert_eq!(cache.compiled_variants(), 1);
+    }
+
+    #[test]
+    fn each_key_axis_is_its_own_variant() {
+        let base = desc();
+        let variants = [
+            RenderPipelineDesc {
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                ..base.clone()
+            },
+            RenderPipelineDesc {
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                ..base.clone()
+            },
+            RenderPipelineDesc {
+                sample_count: 4,
+                ..base.clone()
+            },
+            RenderPipelineDesc {
+                depth: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                ..base.clone()
+            },
+            RenderPipelineDesc {
+                shader: ShaderId::from_raw(1),
+                ..base.clone()
+            },
+            // Same shader id, different entry point: the program axis, not a
+            // silent collision with `base`.
+            RenderPipelineDesc {
+                fs: "fs_other".into(),
+                ..base.clone()
+            },
+            // Same shader id and entry points, different vertex layout.
+            RenderPipelineDesc {
+                vertex_layouts: vec![VertexLayout::per_vertex(
+                    16,
+                    vec![wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x4,
+                        offset: 0,
+                        shader_location: 0,
+                    }],
+                )],
+                ..base.clone()
+            },
+            RenderPipelineDesc {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..base.clone()
+            },
+        ];
+
+        let mut packer = KeyPacker::default();
+        let base_key = packer.key_for(&base).expect("base key");
+        let mut seen = vec![base_key];
+        for variant in &variants {
+            let key = packer.key_for(variant).expect("variant key");
+            assert!(
+                !seen.contains(&key),
+                "{variant:?} must not reuse an existing key"
+            );
+            seen.push(key);
+        }
+
+        // And each of them really is a separate compile.
+        let mut cache = VariantCache::<FakePipeline>::default();
+        let counter = Counter::default();
+        cache.get_or_create(&base, |d| counter.compile(d));
+        for variant in &variants {
+            cache.get_or_create(variant, |d| counter.compile(d));
+        }
+        assert_eq!(counter.count(), 1 + variants.len() as u64);
+    }
+
+    #[test]
+    fn a_key_is_stable_across_repeated_packing() {
+        let mut packer = KeyPacker::default();
+        let desc = desc();
+        let first = packer.key_for(&desc).expect("key");
+        for _ in 0..4 {
+            assert_eq!(packer.key_for(&desc), Some(first));
+        }
+    }
+
+    #[test]
+    fn an_unusable_sample_count_has_no_key_and_is_not_cached() {
+        let mut packer = KeyPacker::default();
+        assert_eq!(
+            packer.key_for(&RenderPipelineDesc {
+                sample_count: 3,
+                ..desc()
+            }),
+            None
+        );
+        assert_eq!(
+            packer.key_for(&RenderPipelineDesc {
+                sample_count: 0,
+                ..desc()
+            }),
+            None
+        );
+
+        // The uncached fallback still returns a usable pipeline, it just
+        // recompiles per request.
+        let mut cache = VariantCache::<FakePipeline>::default();
+        let counter = Counter::default();
+        let odd = RenderPipelineDesc {
+            sample_count: 3,
+            ..desc()
+        };
+        assert_eq!(
+            cache
+                .get_or_create(&odd, |d| counter.compile(d))
+                .sample_count,
+            3
+        );
+        cache.get_or_create(&odd, |d| counter.compile(d));
+        assert_eq!(counter.count(), 2, "an unkeyable variant is never cached");
+    }
+
+    #[test]
+    fn draining_the_queue_builds_every_listed_variant_once() {
+        let mut cache = VariantCache::<FakePipeline>::default();
+        let counter = Counter::default();
+        let listed: Vec<_> = [1u32, 2, 4]
+            .into_iter()
+            .map(|sample_count| RenderPipelineDesc {
+                sample_count,
+                ..desc()
+            })
+            .collect();
+
+        cache.enqueue(&listed);
+        assert_eq!(cache.queued_variants(), 3);
+        VariantCache::drain_queue(&cache.shared(), |d| counter.compile(d));
+        assert_eq!(counter.count(), 3);
+        assert_eq!(cache.queued_variants(), 0);
+
+        // Every warmed variant is now a hit, not a compile.
+        for desc in &listed {
+            cache.get_or_create(desc, |d| counter.compile(d));
+        }
+        assert_eq!(counter.count(), 3, "a warmed variant must not recompile");
+    }
+
+    #[test]
+    fn enqueueing_the_same_variant_twice_queues_one_job() {
+        let mut cache = VariantCache::<FakePipeline>::default();
+        let listed = [desc(), desc()];
+        cache.enqueue(&listed);
+        cache.enqueue(&listed);
+        assert_eq!(cache.queued_variants(), 1);
+    }
+
+    #[test]
+    fn a_render_thread_request_steals_a_queued_job_and_the_queue_skips_it() {
+        let mut cache = VariantCache::<FakePipeline>::default();
+        let counter = Counter::default();
+        let listed: Vec<_> = [1u32, 2, 4]
+            .into_iter()
+            .map(|sample_count| RenderPipelineDesc {
+                sample_count,
+                ..desc()
+            })
+            .collect();
+        cache.enqueue(&listed);
+
+        // The render thread wants the last-listed variant before the worker
+        // has started: it builds it inline rather than waiting its turn.
+        let stolen = cache
+            .get_or_create(&listed[2], |d| counter.compile(d))
+            .serial;
+        assert_eq!(stolen, 0, "the steal is the first compile to run");
+        assert_eq!(counter.count(), 1);
+        assert_eq!(cache.queued_variants(), 2, "the stolen job is done");
+
+        // The worker then builds only what is left — the stolen entry is
+        // marked done, not rebuilt.
+        VariantCache::drain_queue(&cache.shared(), |d| counter.compile(d));
+        assert_eq!(
+            counter.count(),
+            3,
+            "the stolen variant must not compile twice"
+        );
+        assert_eq!(
+            cache
+                .get_or_create(&listed[2], |d| counter.compile(d))
+                .serial,
+            stolen
+        );
+        assert_eq!(counter.count(), 3);
+    }
+
+    #[test]
+    fn a_worker_thread_drain_publishes_to_the_render_thread() {
+        let mut cache = VariantCache::<FakePipeline>::default();
+        let listed: Vec<_> = (0..6)
+            .map(|i| RenderPipelineDesc {
+                shader: ShaderId::from_raw(i),
+                ..desc()
+            })
+            .collect();
+        cache.enqueue(&listed);
+
+        let shared = cache.shared();
+        let worker_counter = Arc::new(Counter::default());
+        let thread_counter = Arc::clone(&worker_counter);
+        let worker = std::thread::spawn(move || {
+            VariantCache::drain_queue(&shared, move |d| thread_counter.compile(d));
+        });
+        worker.join().expect("the warm-up worker must not panic");
+
+        assert_eq!(worker_counter.count(), 6);
+        assert_eq!(cache.compiled_variants(), 6);
+
+        // The render thread now sees the worker's pipelines through the
+        // shared map; its own compile function is never called.
+        let render_counter = Counter::default();
+        for desc in &listed {
+            cache.get_or_create(desc, |d| render_counter.compile(d));
+        }
+        assert_eq!(render_counter.count(), 0);
+    }
+
+    #[test]
+    fn an_abandoned_build_marks_the_job_failed_rather_than_pending() {
+        let cache = VariantCache::<FakePipeline>::default();
+        let shared = cache.shared();
+        let guard = BuildGuard::new(&shared, 42);
+        lock(&shared.inner).jobs.insert(
+            42,
+            Job {
+                desc: desc(),
+                state: JobState::Building,
+            },
+        );
+        // Dropping without publishing is what an unwinding compile does.
+        drop(guard);
+        assert_eq!(
+            lock(&shared.inner).jobs.get(&42).map(|job| job.state),
+            Some(JobState::Failed),
+            "an abandoned build must not leave a Pending job no worker can claim"
+        );
+    }
+
+    /// A compile that panics once, then behaves — the failure mode a driver
+    /// or a malformed shader produces on exactly one variant.
+    struct PanicOnce {
+        counter: Arc<Counter>,
+        armed: AtomicBool,
+    }
+
+    impl PanicOnce {
+        fn new(counter: &Arc<Counter>) -> Self {
+            Self {
+                counter: Arc::clone(counter),
+                armed: AtomicBool::new(true),
+            }
+        }
+
+        fn compile(&self, desc: &RenderPipelineDesc) -> FakePipeline {
+            assert!(
+                !self.armed.swap(false, Ordering::SeqCst),
+                "the fake compile fails its first call"
+            );
+            self.counter.compile(desc)
+        }
+    }
+
+    #[test]
+    fn a_panicking_warm_up_compile_costs_one_variant_and_not_the_queue() {
+        let mut cache = VariantCache::<FakePipeline>::default();
+        let counter = Arc::new(Counter::default());
+        let failing = PanicOnce::new(&counter);
+        let listed: Vec<_> = [1u32, 2, 4]
+            .into_iter()
+            .map(|sample_count| RenderPipelineDesc {
+                sample_count,
+                ..desc()
+            })
+            .collect();
+
+        cache.enqueue(&listed);
+        VariantCache::drain_queue(&cache.shared(), |d| failing.compile(d));
+
+        // The unwind took its own variant down and nothing else: the drain
+        // carried on and built the other two.
+        assert_eq!(counter.count(), 2);
+        assert_eq!(
+            cache.queued_variants(),
+            0,
+            "a failed job must not be counted as still queued forever"
+        );
+
+        // And the failed variant is rebuilt on request rather than waited on.
+        assert_eq!(
+            cache
+                .get_or_create(&listed[0], |d| counter.compile(d))
+                .sample_count,
+            1
+        );
+        assert_eq!(counter.count(), 3);
+
+        // Everything the worker did build is still a hit.
+        for desc in &listed {
+            cache.get_or_create(desc, |d| counter.compile(d));
+        }
+        assert_eq!(counter.count(), 3);
+    }
+
+    #[test]
+    fn a_panicking_inline_build_surfaces_to_the_requester_and_leaves_it_rebuildable() {
+        let mut cache = VariantCache::<FakePipeline>::default();
+        let counter = Arc::new(Counter::default());
+        let failing = PanicOnce::new(&counter);
+        let desc = desc();
+        cache.enqueue(std::slice::from_ref(&desc));
+
+        // The render thread steals the queued job; its compile unwinds, and
+        // the failure lands on the requester rather than anywhere silent.
+        let stolen = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.get_or_create(&desc, |d| failing.compile(d));
+        }));
+        assert!(
+            stolen.is_err(),
+            "an inline compile must not swallow a panic"
+        );
+        assert_eq!(counter.count(), 0);
+
+        // The next request rebuilds it instead of blocking on a build that
+        // will never publish.
+        assert_eq!(cache.get_or_create(&desc, |d| counter.compile(d)).serial, 0);
+        assert_eq!(counter.count(), 1);
+        assert_eq!(cache.queued_variants(), 0);
+    }
+
+    /// A latch a fake compile parks on, so a warm-up worker can be held
+    /// mid-drain while the test makes further `warm_up` calls against the
+    /// same cache.
+    #[derive(Default)]
+    struct Latch {
+        open: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    /// The longest a test waits on a latch before failing: a latch nobody
+    /// opens is a failed test, not a hung suite.
+    const LATCH_WAIT: Duration = Duration::from_secs(30);
+
+    impl Latch {
+        /// Parks until [`Self::open`], and panics once [`LATCH_WAIT`] passes
+        /// without it.
+        fn wait(&self) {
+            let deadline = web_time::Instant::now() + LATCH_WAIT;
+            let mut open = lock(&self.open);
+            while !*open {
+                let left = deadline.saturating_duration_since(web_time::Instant::now());
+                assert!(!left.is_zero(), "the latch was never opened");
+                open = self
+                    .changed
+                    .wait_timeout(open, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+        }
+
+        fn open(&self) {
+            *lock(&self.open) = true;
+            self.changed.notify_all();
+        }
+    }
+
+    /// Opens its latch on drop, so a test that unwinds before opening the
+    /// latch itself still releases the worker parked on it.
+    struct OpenOnDrop(Arc<Latch>);
+
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    fn shader_variants(count: u32) -> Vec<RenderPipelineDesc> {
+        (0..count)
+            .map(|i| RenderPipelineDesc {
+                shader: ShaderId::from_raw(i),
+                ..desc()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn repeated_warm_up_calls_keep_at_most_one_worker() {
+        let mut cache = VariantCache::<FakePipeline>::default();
+        let counter = Arc::new(Counter::default());
+        let latch = Arc::new(Latch::default());
+        let workers = AtomicU64::new(0);
+        let listed = shader_variants(6);
+
+        // Every worker this cache starts calls the factory exactly once, so
+        // counting factory calls counts workers.
+        let make_compile = || {
+            workers.fetch_add(1, Ordering::SeqCst);
+            let counter = Arc::clone(&counter);
+            let latch = Arc::clone(&latch);
+            let held = AtomicBool::new(false);
+            move |d: &RenderPipelineDesc| {
+                if !held.swap(true, Ordering::SeqCst) {
+                    latch.wait();
+                }
+                counter.compile(d)
+            }
+        };
+
+        // One worker starts on the first listed variant and is held there,
+        // so it is unambiguously still live for every later call.
+        cache.warm_up(&listed[..1], make_compile);
+        for _ in 0..8 {
+            cache.warm_up(&listed, make_compile);
+        }
+        assert_eq!(
+            workers.load(Ordering::SeqCst),
+            1,
+            "a live worker must absorb further warm-up calls, not be joined by more"
+        );
+
+        latch.open();
+        cache.shutdown();
+
+        // Whatever the worker did not reach before shutdown is built on
+        // request; either way each variant is compiled exactly once.
+        for desc in &listed {
+            cache.get_or_create(desc, |d| counter.compile(d));
+        }
+        assert_eq!(counter.count(), listed.len() as u64);
+        assert_eq!(cache.compiled_variants(), listed.len() as u64);
+    }
+
+    #[test]
+    fn dropping_the_cache_joins_its_worker() {
+        // Stands in for the `wgpu::Device` handle a real compile function
+        // clones into the worker: if the thread outlived the cache, this
+        // clone would still be alive after the drop.
+        let device = Arc::new(());
+        let counter = Arc::new(Counter::default());
+        let listed = shader_variants(4);
+
+        let mut cache = VariantCache::<FakePipeline>::default();
+        cache.warm_up(&listed, || {
+            let device = Arc::clone(&device);
+            let counter = Arc::clone(&counter);
+            move |d: &RenderPipelineDesc| {
+                let _held = Arc::clone(&device);
+                counter.compile(d)
+            }
+        });
+        drop(cache);
+
+        assert_eq!(
+            Arc::strong_count(&device),
+            1,
+            "no warm-up worker may outlive the cache that started it"
+        );
+    }
+
+    #[test]
+    fn warming_up_after_shutdown_starts_no_worker_and_still_builds_on_request() {
+        let mut cache = VariantCache::<FakePipeline>::default();
+        let counter = Arc::new(Counter::default());
+        let workers = AtomicU64::new(0);
+        let listed = shader_variants(3);
+
+        cache.shutdown();
+        // Idempotent: a second call is a no-op, not a double join.
+        cache.shutdown();
+        cache.warm_up(&listed, || {
+            workers.fetch_add(1, Ordering::SeqCst);
+            let counter = Arc::clone(&counter);
+            move |d: &RenderPipelineDesc| counter.compile(d)
+        });
+
+        assert_eq!(workers.load(Ordering::SeqCst), 0);
+        for desc in &listed {
+            cache.get_or_create(desc, |d| counter.compile(d));
+        }
+        assert_eq!(counter.count(), listed.len() as u64);
+    }
+
+    #[test]
+    fn the_warm_up_is_done_only_once_every_listed_job_has_settled() {
+        let mut cache = VariantCache::<FakePipeline>::default();
+        let counter = Arc::new(Counter::default());
+        assert!(
+            cache.warm_up_done(),
+            "nothing listed is nothing left to build"
+        );
+
+        let failing = PanicOnce::new(&counter);
+        let listed = shader_variants(3);
+        cache.enqueue(&listed);
+        assert!(!cache.warm_up_done(), "pending jobs keep the warm-up open");
+
+        // A failed compile settles its job too: nothing will ever retry it
+        // from the queue, so a waiter must not wait on it.
+        VariantCache::drain_queue(&cache.shared(), |d| failing.compile(d));
+        assert_eq!(counter.count(), 2);
+        assert!(cache.warm_up_done());
+        assert!(cache.wait_warm_up(Duration::ZERO));
+    }
+
+    #[test]
+    fn waiting_for_the_warm_up_builds_nothing_and_returns_once_the_worker_drains() {
+        let mut cache = VariantCache::<FakePipeline>::default();
+        let counter = Arc::new(Counter::default());
+        let latch = Arc::new(Latch::default());
+        let entered = Arc::new(Latch::default());
+        // Declared after the cache, so an unwinding assertion releases the
+        // worker before `VariantCache::drop` joins it.
+        let _release = OpenOnDrop(Arc::clone(&latch));
+        let listed = shader_variants(5);
+
+        // The worker signals that it is inside its first compile, then parks
+        // there until the latch opens.
+        cache.warm_up(&listed, || {
+            let counter = Arc::clone(&counter);
+            let latch = Arc::clone(&latch);
+            let entered = Arc::clone(&entered);
+            move |d: &RenderPipelineDesc| {
+                entered.open();
+                latch.wait();
+                counter.compile(d)
+            }
+        });
+
+        // Once the worker holds its first job, the rest are still queued.
+        entered.wait();
+
+        // Held: a bounded wait times out, and the waiter compiled nothing and
+        // stole nothing — every other job is still the worker's.
+        assert!(!cache.wait_warm_up(Duration::from_millis(20)));
+        assert!(!cache.warm_up_done());
+        assert_eq!(counter.count(), 0);
+        assert_eq!(cache.queued_variants(), listed.len() - 1);
+
+        latch.open();
+        assert!(
+            cache.wait_warm_up(Duration::from_secs(30)),
+            "the wait must return once the worker has drained the queue"
+        );
+        assert_eq!(counter.count(), listed.len() as u64);
+        assert_eq!(cache.queued_variants(), 0);
+
+        // Everything is now a hit for the render thread.
+        let render_counter = Counter::default();
+        for desc in &listed {
+            cache.get_or_create(desc, |d| render_counter.compile(d));
+        }
+        assert_eq!(render_counter.count(), 0);
+        cache.shutdown();
+    }
+
+    #[test]
+    fn a_wait_returns_at_once_when_the_render_thread_already_built_every_listed_variant() {
+        let mut cache = VariantCache::<FakePipeline>::default();
+        let counter = Arc::new(Counter::default());
+        let listed = shader_variants(2);
+        cache.enqueue(&listed);
+
+        // No worker: the render thread steals both, and the warm-up has
+        // settled by the time the wait is made.
+        for desc in &listed {
+            cache.get_or_create(desc, |d| counter.compile(d));
+        }
+        // The wait's own timeout is far longer than this bound: a wait that
+        // sat it out fails here rather than passing slowly.
+        let started = web_time::Instant::now();
+        assert!(cache.wait_warm_up(Duration::from_secs(30)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a settled warm-up must return at once"
+        );
+        assert_eq!(counter.count(), 2);
+    }
+
+    #[test]
+    fn waiting_after_shutdown_with_work_still_queued_returns_at_once() {
+        let mut cache = VariantCache::<FakePipeline>::default();
+        let listed = shader_variants(3);
+        cache.shutdown();
+        cache.warm_up(&listed, || {
+            |_: &RenderPipelineDesc| -> FakePipeline {
+                unreachable!("a shut-down cache starts no worker")
+            }
+        });
+
+        // Nothing will ever build the queued jobs: the wait reports the
+        // unfinished warm-up rather than sitting out the timeout. The bound
+        // is generous for a loaded machine and short enough to fail a
+        // regression that waits it out.
+        let started = web_time::Instant::now();
+        assert!(!cache.wait_warm_up(Duration::from_secs(5)));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(!cache.warm_up_done());
+    }
+
+    /// Pops a validation error scope, pumping the device until the pop
+    /// resolves — the same drain `frust-render`'s shader-effect compile uses,
+    /// since the pop is a future a plain block-on would park on.
+    fn drain_error_scope(
+        device: &wgpu::Device,
+        scope: wgpu::ErrorScopeGuard,
+    ) -> Option<wgpu::Error> {
+        use std::task::{Context, Poll, Waker};
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut future = std::pin::pin!(scope.pop());
+        loop {
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(error) => return error,
+                Poll::Pending => {
+                    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                }
+            }
+        }
+    }
+
+    /// One real pipeline on real hardware: the host tests above all run
+    /// against a fake compile function, so this is the only case that proves
+    /// a `RenderPipelineDesc` actually describes a pipeline wgpu accepts —
+    /// entry points, vertex layout, color target and multisample state
+    /// included — and that the cache still compiles it exactly once.
+    #[test]
+    #[ignore = "requires a GPU (Metal/Vulkan); run locally with `cargo test -p frust-gpu -- --ignored`"]
+    fn creates_one_real_pipeline() {
+        const WGSL: &str = r#"
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 1.0, 0.0, 1.0);
+}
+"#;
+
+        let (device, _queue) = pollster::block_on(async {
+            let instance = wgpu::Instance::new(
+                wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+            );
+            // The environment-aware initializer, so `WGPU_ADAPTER_NAME` picks
+            // the GPU on a multi-adapter host instead of the run silently
+            // landing on whichever one enumerates first.
+            let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, None)
+                .await
+                .expect("no compatible GPU adapter");
+            println!("frust-gpu pipeline test adapter: {:?}", adapter.get_info());
+            adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("frust-gpu pipeline test device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    ..Default::default()
+                })
+                .await
+                .expect("failed to create the device")
+        });
+
+        let mut library = ShaderLibrary::new();
+        let shader = library.insert_wgsl(&device, "fullscreen-green", WGSL);
+        let mut cache = PipelineCache::new(Arc::new(library), None);
+
+        let desc = RenderPipelineDesc::new(
+            shader,
+            "vs_main",
+            "fs_main",
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        for _ in 0..2 {
+            let _pipeline = cache.get_or_create(&device, &desc);
+        }
+        let error = drain_error_scope(&device, scope);
+
+        assert!(error.is_none(), "pipeline creation raised {error:?}");
+        assert_eq!(
+            cache.compiled_variants(),
+            1,
+            "a repeat request must reuse the pipeline"
+        );
+
+        // The explicit-layout axis, on the same device — one device per test
+        // binary run keeps this suite clear of the driver's teardown races.
+        explicit_layout_is_its_own_variant_and_shares_bind_groups(&device);
+    }
+
+    /// The explicit-layout axis on real hardware: a desc naming a layout is a
+    /// variant of its own (never a hit on its derived-layout sibling), naming
+    /// the *same* layout object again is a hit, and two programs that read
+    /// different bindings accept one bind group under that shared layout —
+    /// which is what lets a family of specialised programs share bind groups.
+    fn explicit_layout_is_its_own_variant_and_shares_bind_groups(device: &wgpu::Device) {
+        const LAYOUT_WGSL: &str = r#"
+@group(0) @binding(0) var<uniform> tint: vec4<f32>;
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment
+fn fs_tinted() -> @location(0) vec4<f32> {
+    return tint;
+}
+@fragment
+fn fs_plain() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 1.0, 0.0, 1.0);
+}
+"#;
+
+        let group = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("explicit layout test group"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(16),
+                },
+                count: None,
+            }],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("explicit layout test"),
+            bind_group_layouts: &[Some(&group)],
+            immediate_size: 0,
+        });
+
+        let mut library = ShaderLibrary::new();
+        let shader = library.insert_wgsl(device, "explicit-layout", LAYOUT_WGSL);
+        let mut cache = PipelineCache::new(Arc::new(library), None);
+        let tinted = RenderPipelineDesc::new(
+            shader,
+            "vs_main",
+            "fs_tinted",
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let explicit_tinted = RenderPipelineDesc {
+            layout: Some(layout.clone()),
+            ..tinted.clone()
+        };
+        // `fs_plain` reads no binding at all, so its derived layout would be
+        // empty; under the explicit layout it accepts the tinted program's
+        // group all the same.
+        let explicit_plain = RenderPipelineDesc {
+            layout: Some(layout.clone()),
+            ..RenderPipelineDesc::new(
+                shader,
+                "vs_main",
+                "fs_plain",
+                wgpu::TextureFormat::Rgba8Unorm,
+            )
+        };
+
+        let mut packer = KeyPacker::default();
+        assert_ne!(packer.key_for(&tinted), packer.key_for(&explicit_tinted));
+        assert_eq!(
+            packer.key_for(&explicit_tinted),
+            packer.key_for(&RenderPipelineDesc {
+                layout: Some(layout.clone()),
+                ..tinted.clone()
+            }),
+            "the same layout object is the same variant"
+        );
+
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _ = cache.get_or_create(device, &tinted);
+        let a = cache.get_or_create(device, &explicit_tinted).clone();
+        let b = cache.get_or_create(device, &explicit_plain).clone();
+        let _ = cache.get_or_create(device, &explicit_tinted);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
+        // One group, built against the first pipeline's layout, bound under
+        // both: valid only because both name the explicit layout.
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &a.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_pipeline(&a);
+            pass.draw(0..3, 0..1);
+            pass.set_pipeline(&b);
+            pass.draw(0..3, 0..1);
+        }
+        drop(encoder.finish());
+        drop(group);
+        let error = drain_error_scope(device, scope);
+        assert!(error.is_none(), "pipeline creation raised {error:?}");
+        assert_eq!(cache.compiled_variants(), 3);
+    }
+
+    #[test]
+    fn a_new_desc_derives_its_layout() {
+        assert!(
+            desc().layout.is_none(),
+            "every existing desc keeps wgpu's derived layout unless it names one"
+        );
+        // The layout field sits above every other axis, so a derived-layout
+        // key never reaches it.
+        let mut packer = KeyPacker::default();
+        let key = packer.key_for(&desc()).expect("key");
+        assert_eq!(key >> LAYOUT_SHIFT, 0);
+    }
+
+    /// The shader warm-up pool: one thread per module, never more than the
+    /// machine leaves beside the calling thread, never none.
+    #[test]
+    fn the_shader_pool_is_one_thread_per_module_within_the_machine() {
+        assert_eq!(shader_thread_count(4, 12), 4);
+        assert_eq!(shader_thread_count(4, 8), 4);
+        assert_eq!(shader_thread_count(4, 4), 3);
+        assert_eq!(shader_thread_count(4, 2), 1);
+        assert_eq!(shader_thread_count(4, 1), 1);
+        assert_eq!(shader_thread_count(1, 12), 1);
+        assert_eq!(shader_thread_count(12, 8), 7);
+    }
+}

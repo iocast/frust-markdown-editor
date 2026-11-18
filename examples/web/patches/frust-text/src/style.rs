@@ -1,0 +1,540 @@
+//! [`TextStyle`]: the styling knobs applied uniformly to a laid-out string —
+//! family, weight, style (italic/oblique), size, color, letter-spacing, and
+//! line-height (the M3 type-scale surface).
+//!
+//! Every type here is Frust-owned, not a parley re-export (scene-layer
+//! purity, see `docs/ARCHITECTURE.md`): [`FontFamily`]/[`FontWeight`]/
+//! [`FontStyle`]/[`LineHeight`] mirror parley 0.11's own semantics (see
+//! `parley::style`) so the conversion in [`crate::context`]/[`crate::editor`]
+//! is a straight match, but no parley type appears in this module's public
+//! API. Rich per-range styling and bundled/custom font registration are
+//! deferred.
+
+use peniko::Color;
+
+/// One element of a fallback stack: a concrete family name or a generic class.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FamilyName {
+    /// A concrete named font family (e.g. "Inter", "IBM Plex Mono").
+    Named(String),
+    /// A generic fallback family (e.g. monospace, serif).
+    Generic(GenericSlot),
+}
+
+/// Generic font families supported as fallback slots.
+///
+/// This is a curated subset of parley's [`parley::GenericFamily`] covering
+/// the generic families Frust explicitly supports and exposes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenericSlot {
+    /// A monospace (fixed-width) font family.
+    Monospace,
+    /// A sans-serif font family.
+    SansSerif,
+    /// A serif font family.
+    Serif,
+    /// The platform system UI font.
+    SystemUi,
+    /// Color emoji or symbol glyphs.
+    Emoji,
+}
+
+/// Font family selection.
+///
+/// The default, [`FontFamily::SystemUi`], resolves to the platform UI font
+/// (e.g. San Francisco on macOS) via fontique's system collection with no
+/// registration required. [`FontFamily::Named`] is an ordered fallback stack
+/// of named families, tried in order; a name that doesn't resolve on the
+/// current platform falls back per parley's own fallback behavior — no error
+/// surface is exposed here. [`FontFamily::NamedWithGeneric`] extends
+/// [`FontFamily::Named`] by allowing the stack to end with a generic
+/// fallback family (e.g. monospace, serif).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum FontFamily {
+    /// The platform system UI font. Default.
+    #[default]
+    SystemUi,
+    /// An ordered fallback stack of named font families.
+    Named(Vec<String>),
+    /// An ordered fallback stack of named families ending in a generic fallback.
+    NamedWithGeneric(Vec<FamilyName>),
+}
+
+impl FontFamily {
+    /// A single named font family.
+    pub fn named(name: impl Into<String>) -> Self {
+        Self::Named(vec![name.into()])
+    }
+
+    /// An ordered fallback stack of named font families, tried in order.
+    pub fn stack(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::Named(names.into_iter().map(Into::into).collect())
+    }
+
+    /// An ordered fallback stack of named font families ending in a generic
+    /// fallback family.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use frust_text::{FontFamily, GenericSlot};
+    ///
+    /// // Try "IBM Plex Mono" first, fall back to system monospace
+    /// let family = FontFamily::stack_with_generic(
+    ///     ["IBM Plex Mono"],
+    ///     GenericSlot::Monospace,
+    /// );
+    /// ```
+    pub fn stack_with_generic(
+        names: impl IntoIterator<Item = impl Into<String>>,
+        generic: GenericSlot,
+    ) -> Self {
+        let mut families: Vec<FamilyName> = names
+            .into_iter()
+            .map(|name| FamilyName::Named(name.into()))
+            .collect();
+        families.push(FamilyName::Generic(generic));
+        Self::NamedWithGeneric(families)
+    }
+}
+
+/// Visual weight of a font, on the standard 1-1000 CSS `font-weight` scale.
+///
+/// Mirrors parley/fontique's `FontWeight` (see `parley::FontWeight`) without
+/// leaking the type itself past this crate's boundary.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct FontWeight(f32);
+
+impl FontWeight {
+    /// Weight value of 100.
+    pub const THIN: Self = Self(100.0);
+    /// Weight value of 200.
+    pub const EXTRA_LIGHT: Self = Self(200.0);
+    /// Weight value of 300.
+    pub const LIGHT: Self = Self(300.0);
+    /// Weight value of 400. Default.
+    pub const REGULAR: Self = Self(400.0);
+    /// Weight value of 500.
+    pub const MEDIUM: Self = Self(500.0);
+    /// Weight value of 600.
+    pub const SEMI_BOLD: Self = Self(600.0);
+    /// Weight value of 700.
+    pub const BOLD: Self = Self(700.0);
+    /// Weight value of 800.
+    pub const EXTRA_BOLD: Self = Self(800.0);
+    /// Weight value of 900.
+    pub const BLACK: Self = Self(900.0);
+
+    /// A custom weight value (1-1000 scale by convention; not clamped).
+    pub const fn new(value: f32) -> Self {
+        Self(value)
+    }
+
+    /// The underlying numeric weight value.
+    pub const fn value(self) -> f32 {
+        self.0
+    }
+}
+
+impl Default for FontWeight {
+    fn default() -> Self {
+        Self::REGULAR
+    }
+}
+
+/// Visual slant of a font.
+///
+/// Mirrors parley/fontique's `FontStyle` (see `parley::FontStyle`).
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum FontStyle {
+    /// An upright or "roman" style. Default.
+    #[default]
+    Normal,
+    /// A slanted style, generally with a different structure from the
+    /// normal style.
+    Italic,
+    /// A slanted style derived from the normal style, with an optional angle
+    /// in degrees (`None` uses the engine-specific default angle).
+    Oblique(Option<f32>),
+}
+
+/// Paragraph alignment: how each line is positioned within the layout's
+/// width.
+///
+/// Mirrors parley's `Alignment` semantics (see `parley::layout::Alignment`)
+/// without leaking the parley type. Only meaningful when the layout is
+/// wrapped to a `max_width` ([`crate::TextContext::layout`]'s third
+/// argument) — an unbounded layout's line width already equals its content
+/// width, so every alignment renders identically to [`TextAlign::Start`].
+///
+/// **Applies to [`crate::TextContext::layout`] only.** A live-edited
+/// [`crate::TextEditor`] (the engine behind `TextInput`) does not read this
+/// field — see that type's docs for why editable text is out of scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum TextAlign {
+    /// Leading edge of the line's text direction (left for LTR, right for
+    /// RTL). Default — matches v1's hardcoded behavior exactly.
+    #[default]
+    Start,
+    /// Trailing edge of the line's text direction (right for LTR, left for
+    /// RTL).
+    End,
+    /// Always the left edge, regardless of text direction.
+    Left,
+    /// Each line centered within the layout's width.
+    Center,
+    /// Always the right edge, regardless of text direction.
+    Right,
+    /// Each line except the last is spaced out to fill the layout's width.
+    Justify,
+}
+
+/// How text that overflows a bounded [`TextContext::layout_bounded`]
+/// (`max_lines`) is handled.
+///
+/// Mirrors Flutter's `TextOverflow.clip`/`TextOverflow.ellipsis` shape (a
+/// deliberately small subset — no `fade`/`visible`). Only meaningful
+/// alongside `max_lines`: with no line cap, neither variant changes
+/// anything (there is nothing to overflow past).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum TextOverflow {
+    /// Drop whole lines past `max_lines` outright; the last visible line's
+    /// own text is left exactly as the line-breaker assigned it, even if it
+    /// is itself wider than the box (an unbreakable run with no wrap
+    /// opportunity) — Frust does not character-trim in this mode. Default,
+    /// and a no-op when `max_lines` is unset (today's behavior).
+    #[default]
+    Clip,
+    /// Same line-dropping as [`Self::Clip`], plus: the last visible line is
+    /// character-truncated (UTF-8/char-boundary safe) and has `'…'`
+    /// appended so it fits the layout's `max_width`. With an unbounded
+    /// `max_width`, there is no width to truncate against, so the last
+    /// visible line's full text is kept with `'…'` simply appended.
+    Ellipsis,
+}
+
+/// Line height: how much vertical space each line of text occupies.
+///
+/// Mirrors parley's `LineHeight` semantics (see `parley::LineHeight`)
+/// without leaking the parley type. M3's type scale specifies line heights
+/// in absolute logical pixels ([`LineHeight::Absolute`]);
+/// [`LineHeight::FontSizeRelative`] is the documented M3-friendly choice when
+/// a consistent, font-independent ratio is preferred instead.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LineHeight {
+    /// A multiple of the font's own metrics-derived line height (ascender +
+    /// descender + line gap/leading). `1.0` is the font's natural line
+    /// height.
+    MetricsRelative(f32),
+    /// A multiple of the font size — CSS's unitless `line-height`. Useful
+    /// for consistent line heights across platforms/fonts when using
+    /// system-defined generic families.
+    FontSizeRelative(f32),
+    /// An absolute line height in logical pixels.
+    Absolute(f32),
+}
+
+impl Default for LineHeight {
+    /// Matches parley's own default: the font's natural metrics-relative
+    /// line height.
+    fn default() -> Self {
+        Self::MetricsRelative(1.0)
+    }
+}
+
+/// Styling applied uniformly to a laid-out string.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextStyle {
+    /// Font family (or fallback stack).
+    pub family: FontFamily,
+    /// Font weight.
+    pub weight: FontWeight,
+    /// Font style (upright/italic/oblique).
+    pub style: FontStyle,
+    /// Font size in logical pixels.
+    pub size: f32,
+    /// Fill color for the glyphs.
+    pub color: Color,
+    /// Extra spacing between letters, in logical pixels.
+    pub letter_spacing: f32,
+    /// Line height.
+    pub line_height: LineHeight,
+    /// Paragraph alignment. Defaults to [`TextAlign::Start`].
+    pub align: TextAlign,
+}
+
+impl TextStyle {
+    /// A style with the given `size` and `color`; every other knob keeps its
+    /// [`Default`] value.
+    pub fn new(size: f32, color: Color) -> Self {
+        Self {
+            size,
+            color,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for TextStyle {
+    /// System UI family, 400 weight, upright, 16px, opaque black, no extra
+    /// letter-spacing, the font's natural line height.
+    fn default() -> Self {
+        Self {
+            family: FontFamily::default(),
+            weight: FontWeight::default(),
+            style: FontStyle::default(),
+            size: 16.0,
+            color: Color::BLACK,
+            letter_spacing: 0.0,
+            line_height: LineHeight::default(),
+            align: TextAlign::default(),
+        }
+    }
+}
+
+/// Converts a Frust [`FontFamily`] into parley's owned `'static`
+/// `FontFamily`. `pub(crate)` — parley types must not leak past the crate
+/// boundary (scene-layer purity); shared by [`crate::context`] and
+/// [`crate::editor`].
+pub(crate) fn to_parley_family(family: &FontFamily) -> parley::FontFamily<'static> {
+    match family {
+        FontFamily::SystemUi => parley::GenericFamily::SystemUi.into(),
+        FontFamily::Named(names) => {
+            let list: Vec<parley::FontFamilyName<'static>> = names
+                .iter()
+                .map(|name| parley::FontFamilyName::Named(name.clone().into()))
+                .collect();
+            parley::FontFamily::List(list.into())
+        }
+        FontFamily::NamedWithGeneric(families) => {
+            let list: Vec<parley::FontFamilyName<'static>> = families
+                .iter()
+                .map(|f| match f {
+                    FamilyName::Named(name) => parley::FontFamilyName::Named(name.clone().into()),
+                    FamilyName::Generic(slot) => {
+                        parley::FontFamilyName::Generic(generic_slot_to_parley(*slot))
+                    }
+                })
+                .collect();
+            parley::FontFamily::List(list.into())
+        }
+    }
+}
+
+/// Converts a Frust [`GenericSlot`] into parley's `GenericFamily`.
+/// `pub(crate)` — see [`to_parley_family`].
+fn generic_slot_to_parley(slot: GenericSlot) -> parley::GenericFamily {
+    match slot {
+        GenericSlot::Monospace => parley::GenericFamily::Monospace,
+        GenericSlot::SansSerif => parley::GenericFamily::SansSerif,
+        GenericSlot::Serif => parley::GenericFamily::Serif,
+        GenericSlot::SystemUi => parley::GenericFamily::SystemUi,
+        GenericSlot::Emoji => parley::GenericFamily::Emoji,
+    }
+}
+
+/// Converts a Frust [`FontWeight`] into parley's `FontWeight`. `pub(crate)`
+/// — see [`to_parley_family`].
+pub(crate) fn to_parley_weight(weight: FontWeight) -> parley::FontWeight {
+    parley::FontWeight::new(weight.0)
+}
+
+/// Converts a Frust [`FontStyle`] into parley's `FontStyle`. `pub(crate)`
+/// — see [`to_parley_family`].
+pub(crate) fn to_parley_style(style: FontStyle) -> parley::FontStyle {
+    match style {
+        FontStyle::Normal => parley::FontStyle::Normal,
+        FontStyle::Italic => parley::FontStyle::Italic,
+        FontStyle::Oblique(angle) => parley::FontStyle::Oblique(angle),
+    }
+}
+
+/// Converts a Frust [`LineHeight`] into parley's `LineHeight`.
+/// `pub(crate)` — see [`to_parley_family`].
+pub(crate) fn to_parley_line_height(line_height: LineHeight) -> parley::LineHeight {
+    match line_height {
+        LineHeight::MetricsRelative(v) => parley::LineHeight::MetricsRelative(v),
+        LineHeight::FontSizeRelative(v) => parley::LineHeight::FontSizeRelative(v),
+        LineHeight::Absolute(v) => parley::LineHeight::Absolute(v),
+    }
+}
+
+/// Converts a Frust [`TextAlign`] into parley's `layout::Alignment`.
+/// `pub(crate)` — see [`to_parley_family`]. Shared by [`crate::context`]
+/// (the initial shape+break) and [`crate::shape_cache`] (the width-change
+/// re-break path) — both must apply the same alignment, or a resized layout
+/// silently reverts to [`TextAlign::Start`] (see the shape cache's module
+/// docs).
+pub(crate) fn to_parley_align(align: TextAlign) -> parley::layout::Alignment {
+    match align {
+        TextAlign::Start => parley::layout::Alignment::Start,
+        TextAlign::End => parley::layout::Alignment::End,
+        TextAlign::Left => parley::layout::Alignment::Left,
+        TextAlign::Center => parley::layout::Alignment::Center,
+        TextAlign::Right => parley::layout::Alignment::Right,
+        TextAlign::Justify => parley::layout::Alignment::Justify,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_preserves_old_v1_semantics() {
+        let style = TextStyle::default();
+        assert_eq!(style.family, FontFamily::SystemUi);
+        assert_eq!(style.weight, FontWeight::REGULAR);
+        assert_eq!(style.style, FontStyle::Normal);
+        assert_eq!(style.size, 16.0);
+        assert_eq!(style.color, Color::BLACK);
+        assert_eq!(style.letter_spacing, 0.0);
+        assert_eq!(style.line_height, LineHeight::MetricsRelative(1.0));
+        assert_eq!(style.align, TextAlign::Start);
+    }
+
+    #[test]
+    fn new_only_overrides_size_and_color() {
+        let style = TextStyle::new(24.0, Color::from_rgb8(0x11, 0x22, 0x33));
+        assert_eq!(style.size, 24.0);
+        assert_eq!(style.color, Color::from_rgb8(0x11, 0x22, 0x33));
+        assert_eq!(style.family, FontFamily::SystemUi);
+        assert_eq!(style.weight, FontWeight::REGULAR);
+        assert_eq!(style.style, FontStyle::Normal);
+        assert_eq!(style.align, TextAlign::Start);
+    }
+
+    #[test]
+    fn to_parley_align_maps_every_variant() {
+        assert_eq!(
+            to_parley_align(TextAlign::Start),
+            parley::layout::Alignment::Start
+        );
+        assert_eq!(
+            to_parley_align(TextAlign::End),
+            parley::layout::Alignment::End
+        );
+        assert_eq!(
+            to_parley_align(TextAlign::Left),
+            parley::layout::Alignment::Left
+        );
+        assert_eq!(
+            to_parley_align(TextAlign::Center),
+            parley::layout::Alignment::Center
+        );
+        assert_eq!(
+            to_parley_align(TextAlign::Right),
+            parley::layout::Alignment::Right
+        );
+        assert_eq!(
+            to_parley_align(TextAlign::Justify),
+            parley::layout::Alignment::Justify
+        );
+    }
+
+    #[test]
+    fn font_weight_consts_match_css_scale() {
+        assert_eq!(FontWeight::THIN.value(), 100.0);
+        assert_eq!(FontWeight::REGULAR.value(), 400.0);
+        assert_eq!(FontWeight::MEDIUM.value(), 500.0);
+        assert_eq!(FontWeight::BOLD.value(), 700.0);
+        assert_eq!(FontWeight::BLACK.value(), 900.0);
+    }
+
+    #[test]
+    fn family_named_and_stack_constructors() {
+        assert_eq!(
+            FontFamily::named("Inter"),
+            FontFamily::Named(vec!["Inter".to_string()])
+        );
+        assert_eq!(
+            FontFamily::stack(["Inter", "Roboto"]),
+            FontFamily::Named(vec!["Inter".to_string(), "Roboto".to_string()])
+        );
+    }
+
+    #[test]
+    fn stack_with_generic_creates_correct_variant() {
+        let family = FontFamily::stack_with_generic(["IBM Plex Mono"], GenericSlot::Monospace);
+        match family {
+            FontFamily::NamedWithGeneric(families) => {
+                assert_eq!(families.len(), 2);
+                assert_eq!(families[0], FamilyName::Named("IBM Plex Mono".to_string()));
+                assert_eq!(families[1], FamilyName::Generic(GenericSlot::Monospace));
+            }
+            _ => panic!("Expected NamedWithGeneric variant"),
+        }
+    }
+
+    #[test]
+    fn to_parley_family_named_then_generic() {
+        let family = FontFamily::stack_with_generic(["NoSuchFont"], GenericSlot::Monospace);
+        let parley_family = to_parley_family(&family);
+
+        // Verify it's a List (not a single GenericFamily)
+        match parley_family {
+            parley::FontFamily::List(_) => {
+                // Expected: the list should contain both the named font and the generic fallback
+            }
+            _ => panic!("Expected FontFamily::List variant"),
+        }
+    }
+
+    #[test]
+    fn generic_slot_maps_correctly_to_parley() {
+        let mono = generic_slot_to_parley(GenericSlot::Monospace);
+        assert_eq!(mono, parley::GenericFamily::Monospace);
+
+        let sans = generic_slot_to_parley(GenericSlot::SansSerif);
+        assert_eq!(sans, parley::GenericFamily::SansSerif);
+
+        let serif = generic_slot_to_parley(GenericSlot::Serif);
+        assert_eq!(serif, parley::GenericFamily::Serif);
+
+        let system = generic_slot_to_parley(GenericSlot::SystemUi);
+        assert_eq!(system, parley::GenericFamily::SystemUi);
+
+        let emoji = generic_slot_to_parley(GenericSlot::Emoji);
+        assert_eq!(emoji, parley::GenericFamily::Emoji);
+    }
+
+    /// Layout integration test: verify that a nonexistent font name followed by
+    /// a generic monospace fallback resolves to a monospace font. Monospace
+    /// fonts have equal character advance widths; we assert that 'i' and 'm'
+    /// have the same advance, which is true for monospace but not proportional
+    /// fonts.
+    #[test]
+    fn stack_with_generic_monospace_fallback_shapes_correctly() {
+        // Use a family name that almost certainly doesn't exist, ensuring
+        // the fallback must engage.
+        let family = FontFamily::stack_with_generic(
+            ["NonexistentFontFamilyName12345"],
+            GenericSlot::Monospace,
+        );
+
+        // Convert to parley's format and verify it contains both the named
+        // font and the generic fallback.
+        let parley_family = to_parley_family(&family);
+
+        // The list should be a multi-entry family list, not a single generic.
+        match parley_family {
+            parley::FontFamily::List(list) => {
+                // Should have at least 2 entries: the named font + the generic fallback.
+                assert!(
+                    list.len() >= 2,
+                    "expected at least 2 family entries (named + generic), got {}",
+                    list.len()
+                );
+                // The last entry should be the generic family (Generic, not Named).
+                if let Some(last) = list.last() {
+                    assert!(
+                        matches!(last, parley::FontFamilyName::Generic(_)),
+                        "expected last entry to be a generic family, got {:?}",
+                        last
+                    );
+                }
+            }
+            _ => panic!("expected FontFamily::List variant from stack_with_generic"),
+        }
+    }
+}

@@ -1,0 +1,40 @@
+# Web example: the editor in the browser (WebAssembly; WebGPU with a WebGL2
+# fallback).
+#
+#   rustup target add wasm32-unknown-unknown
+#   cargo install trunk
+#   cd examples/web && trunk serve --open
+#
+# `cargo run` in this folder runs the same app on the desktop.
+
+[package]
+name = "frust-markdown-editor-web"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Own workspace: not part of the library package.
+[workspace]
+
+[dependencies]
+# 0.6.6 or later: earlier releases panic at start in the browser (they read
+# `std::time::Instant`). All Frust crates must have the same version.
+frust = { package = "frust-ui", version = "0.6.6" }
+frust-beui = "0.6.6"
+frust-cupertino = "0.6.6"
+frust-glyph = "0.6.6"
+# `syntect`: syntax highlighting for code blocks (adds a few MB to the download).
+frust-markdown-editor = { path = "../..", features = ["images", "syntect"] }
+frust-material = "0.6.6"
+frust-shadcn = "0.6.6"
+# File dialog; in the browser it opens the browser's file picker.
+rfd = "0.17"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Needed by the browser entry point `frust::app!` generates.
+wasm-bindgen = "0.2"

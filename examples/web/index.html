@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Phones: the page shrinks when the on-screen keyboard opens (Chrome),
+         so the editor stays above it. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, interactive-widget=resizes-content"
+    />
+    <title>frust-markdown-editor · web demo</title>
+    <!-- Trunk builds the app, runs wasm-bindgen and starts the module. -->
+    <link data-trunk rel="rust" data-wasm-opt="z" />
+    <!-- Frust's host-page glue (from frust-shell-web/platform/web): keeps the
+         canvas sized to #frust-host, which Frust's own canvas does not do. -->
+    <link data-trunk rel="copy-file" href="frust_web.js" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        /* No pull-to-refresh or bounce while scrolling the editor. */
+        overscroll-behavior: none;
+        background: #dcdee3;
+      }
+      #frust-host {
+        display: block;
+        width: 100%;
+        height: 100%;
+        line-height: 0;
+      }
+      #frust-host > canvas {
+        display: block;
+        outline: none;
+        /* Touches go to the editor (scrolling, selecting, pinch zoom),
+           not to the browser's own panning and double-tap zoom. */
+        touch-action: none;
+        -webkit-user-select: none;
+        user-select: none;
+        -webkit-touch-callout: none;
+        -webkit-tap-highlight-color: transparent;
+      }
+      #frust-log:empty {
+        display: none;
+      }
+      #frust-log {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        margin: 0;
+        padding: 6px 8px;
+        background: #3a0d0d;
+        color: #ffd7d7;
+        font: 13px/1.45 ui-monospace, Menlo, Consolas, monospace;
+        white-space: pre-wrap;
+      }
+    </style>
+    <script type="module">
+      import { mount } from "./frust_web.js";
+      // Trunk already starts the wasm module; mount() only binds the canvas
+      // Frust creates to #frust-host and keeps it sized.
+      mount(() => Promise.resolve(), { host: "#frust-host" });
+
+      // Safari does not shrink the page for the on-screen keyboard: size the
+      // host to the visible part of the window, so the caret and the
+      // toolbar stay above the keyboard.
+      const host = document.querySelector("#frust-host");
+      const viewport = window.visualViewport;
+      if (viewport) {
+        const fit = () => {
+          host.style.height = `${viewport.height}px`;
+          window.scrollTo(0, 0);
+        };
+        viewport.addEventListener("resize", fit);
+        viewport.addEventListener("scroll", fit);
+        fit();
+      }
+    </script>
+  </head>
+  <body>
+    <div id="frust-host"></div>
+    <pre id="frust-log"></pre>
+  </body>
+</html>

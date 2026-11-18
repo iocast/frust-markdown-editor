@@ -1,0 +1,13 @@
+base_url = "https://iocast.github.io/frust-markdown-editor"
+title = "frust-markdown-editor"
+description = "A Word-style WYSIWYG Markdown editor widget for Frust. Desktop and web."
+compile_sass = false
+build_search_index = false
+
+[extra]
+repository = "https://github.com/iocast/frust-markdown-editor"
+crate = "https://crates.io/crates/frust-markdown-editor"
+docs = "https://docs.rs/frust-markdown-editor"
+framework = "https://frust.dev"
+# Replaced with the release tag by .github/workflows/website.yml on deploy.
+version = "0.3.1"
