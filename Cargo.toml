@@ -22,7 +22,7 @@ images = ["markdown-editor-core/images"]
 
 [dependencies]
 # Document, Markdown, layout and editing: everything but the interface.
-markdown-editor-core = "^0.1"
+markdown-editor-core = "^0.1.1"
 # The UI framework (crate `frust-ui`, imported as `frust`).
 frust = { package = "frust-ui", version = "^0.6" }
 # Only for `mark_pending_result_flush`, which the facade does not re-export.
