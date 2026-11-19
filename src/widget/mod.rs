@@ -177,6 +177,10 @@ impl EditorState {
         image_loader(loader: impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static);
         /// Builder: sets the mode.
         mode(mode: Mode);
+        /// Builder: makes the document read-only, e.g. to show Markdown
+        /// rather than edit it ([`EditorCore::set_read_only`]). The widget
+        /// leaves out the toolbar, shows no caret and no on-screen keyboard.
+        read_only(read_only: bool);
     }
 
     setters! {
@@ -214,6 +218,9 @@ impl EditorState {
         /// Switches between WYSIWYG and source mode. The undo history starts
         /// again after a switch.
         set_mode(mode: Mode);
+        /// Makes the document read-only or editable again
+        /// ([`EditorCore::set_read_only`]).
+        set_read_only(read_only: bool);
     }
 
     /// Builder: sets the language of the toolbar, link bar and status bar.

@@ -67,6 +67,11 @@ pub enum Length {
     Fill,
     /// A fixed number of logical pixels.
     Fixed(f32),
+    /// Height only: as tall as the document and the bars, so the page
+    /// never scrolls vertically. Place the editor in a scrolling parent,
+    /// e.g. to show Markdown in a page ([`EditorState::read_only`]). As a
+    /// width it acts like [`Length::Fill`].
+    Content,
 }
 
 impl From<f32> for Length {
@@ -78,8 +83,8 @@ impl From<f32> for Length {
 impl Length {
     fn resolve(self, max: f64, fallback: f32) -> f32 {
         match self {
-            Length::Fill if max.is_finite() => max as f32,
-            Length::Fill => fallback,
+            Length::Fill | Length::Content if max.is_finite() => max as f32,
+            Length::Fill | Length::Content => fallback,
             Length::Fixed(pixels) => pixels,
         }
     }
@@ -191,7 +196,10 @@ impl<'a> MarkdownEditor<'a> {
             zoom_settings: state.zoom_settings.clone(),
             tab_width: state.tab_width,
             features: state.features,
-            accepts_drops: state.image_settings.enabled() && state.image_settings.drop,
+            read_only: state.read_only,
+            accepts_drops: state.image_settings.enabled()
+                && state.image_settings.drop
+                && !state.read_only,
             has_effects: !state.lock_link().effects.is_empty(),
             touch: state.touch,
         };
@@ -201,7 +209,8 @@ impl<'a> MarkdownEditor<'a> {
             .as_ref()
             .filter(|_| state.link_url.is_some());
         let bars = Bars {
-            toolbar: self.toolbar.then(|| toolbar::toolbar(state)),
+            // Nothing on it works in a read-only document.
+            toolbar: (self.toolbar && !state.read_only).then(|| toolbar::toolbar(state)),
             link: (state.link_url.is_some() && link_dialog.is_none())
                 .then(|| toolbar::link_bar(&palette, state.language, state.touch)),
             status: self.status_bar.then(|| toolbar::status_bar(state)),
@@ -267,6 +276,7 @@ struct Page {
     zoom_settings: ZoomSettings,
     tab_width: usize,
     features: Features,
+    read_only: bool,
     accepts_drops: bool,
     /// Effects (e.g. a copy run by the application) wait for the widget.
     has_effects: bool,
@@ -288,8 +298,22 @@ impl PartialEq for Page {
             && self.zoom_settings == other.zoom_settings
             && self.tab_width == other.tab_width
             && self.features == other.features
+            && self.read_only == other.read_only
             && self.accepts_drops == other.accepts_drops
             && self.touch == other.touch
+    }
+}
+
+impl Page {
+    /// Whether `command` does anything with these features and read-only
+    /// state (see `EditorCore::allows`).
+    fn allows(&self, command: &Command) -> bool {
+        self.features.allows(command) && !(self.read_only && command.edits())
+    }
+
+    /// The caret is shown and the on-screen keyboard is wanted.
+    fn typing(&self) -> bool {
+        self.focused && !self.link_open && !self.read_only
     }
 }
 
@@ -539,6 +563,12 @@ impl<State: 'static> View<State> for EditorView<State> {
         }
         if self.page != element.page {
             flags |= ChangeFlags::PAINT;
+        }
+        let content_height = |page: &Page| page.layout.content_height;
+        if self.height == Length::Content
+            && (content_height(&self.page) - content_height(&element.page)).abs() > 0.5
+        {
+            flags |= ChangeFlags::LAYOUT;
         }
         element.page = self.page.clone();
         element.sync(ctx.has_focus());
@@ -1446,7 +1476,9 @@ impl EditorWidget {
         ctx.request_focus();
         // Published right away, inside the user's gesture: mobile browsers
         // only show their keyboard then. Paint follows with the caret.
-        ctx.publish_ime_state(ime_state(None));
+        if !self.page.read_only {
+            ctx.publish_ime_state(ime_state(None));
+        }
         let modifiers = self.current_modifiers();
         self.dispatch(ctx, Inner::Modifiers(modifiers));
         self.dispatch(ctx, Inner::Press { x, y, clicks });
@@ -1572,6 +1604,15 @@ impl EditorWidget {
         if dx == 0.0 && self.current_modifiers().shift() {
             std::mem::swap(&mut dx, &mut dy);
         }
+        // Content that fits leaves the wheel to a scrolling parent.
+        let (vertical, horizontal) = scrollbars(&self.page, self.page_rect.size());
+        let (dx, dy) = (
+            if horizontal.is_some() { dx } else { 0.0 },
+            if vertical.is_some() { dy } else { 0.0 },
+        );
+        if dx == 0.0 && dy == 0.0 {
+            return EventResult::Ignored;
+        }
         self.dispatch(ctx, Inner::ScrollBy { dx, dy });
         EventResult::Handled
     }
@@ -1666,15 +1707,17 @@ impl EditorWidget {
             && let Key::Character(c) = key.as_ref()
         {
             let c = c.to_lowercase();
-            // Shortcuts of disabled features go to the application.
-            let allowed = builtin_command(&c, modifiers.shift())
-                .filter(|command| self.page.features.allows(command));
+            // Shortcuts of disabled features (or edits of a read-only
+            // document) go to the application.
+            let allowed =
+                builtin_command(&c, modifiers.shift()).filter(|command| self.page.allows(command));
             if allowed.is_none() {
                 return EventResult::Ignored;
             }
         }
 
-        let tab = self.page.tab_width > 0 && !modifiers.command();
+        let writable = !self.page.read_only;
+        let tab = self.page.tab_width > 0 && !modifiers.command() && writable;
         let editing_key = match key.as_ref() {
             Key::Named(Named::Tab) => tab,
             Key::Named(
@@ -1686,18 +1729,20 @@ impl EditorWidget {
                 | Named::End
                 | Named::PageUp
                 | Named::PageDown
-                | Named::Backspace
-                | Named::Delete
-                | Named::Enter
-                | Named::Escape,
+                | Named::Escape
+                | Named::Copy,
             ) => true,
-            Key::Named(Named::Copy | Named::Cut | Named::Paste) => true,
-            Key::Character(_) => true,
+            Key::Named(
+                Named::Backspace | Named::Delete | Named::Enter | Named::Cut | Named::Paste,
+            ) => writable,
+            // Ctrl/Cmd shortcuts were checked above.
+            Key::Character(_) => writable || modifiers.command(),
             _ => false,
         };
-        let types_text = text
-            .as_ref()
-            .is_some_and(|text| !text.is_empty() && text.chars().all(|c| !c.is_control()));
+        let types_text = writable
+            && text
+                .as_ref()
+                .is_some_and(|text| !text.is_empty() && text.chars().all(|c| !c.is_control()));
         if !editing_key && !types_text {
             return EventResult::Ignored;
         }
@@ -1722,7 +1767,7 @@ impl EditorWidget {
         if let Some(pod) = self.focused_field() {
             return route_event_single(pod, ctx, event);
         }
-        if !self.page.focused || self.page.link_open {
+        if !self.page.typing() {
             return EventResult::Ignored;
         }
         match ime {
@@ -1745,6 +1790,9 @@ impl EditorWidget {
             return route_event_single(pod, ctx, event);
         }
         if self.page.link_open {
+            return EventResult::Ignored;
+        }
+        if self.page.read_only && matches!(command, EditCommand::Cut | EditCommand::Paste(_)) {
             return EventResult::Ignored;
         }
         match command {
@@ -1796,7 +1844,7 @@ impl EditorWidget {
         // Selection and caret.
         let mut overlay = draw::frame(rect.size());
         render::draw_selection(&mut overlay, &page.layout, page.sel, &page.palette);
-        if page.focused && !page.link_open && self.caret_phase().0 {
+        if page.typing() && self.caret_phase().0 {
             render::draw_caret(&mut overlay, &page.layout, page.sel, &page.palette);
         }
         draw::replay(overlay.ops(), scene, Some(visible));
@@ -1961,8 +2009,8 @@ impl Widget for EditorWidget {
             self.width.resolve(max.width, FALLBACK.width) as f64,
             self.height.resolve(max.height, FALLBACK.height) as f64,
         );
-        let constrained = bc.constrain(wanted);
-        let size = Size::new(constrained.width as f32, constrained.height as f32);
+        let mut constrained = bc.constrain(wanted);
+        let mut size = Size::new(constrained.width as f32, constrained.height as f32);
         self.size = size;
         let width = size.width;
         let mut y = 0.0;
@@ -2025,11 +2073,27 @@ impl Widget for EditorWidget {
             _ => (Rectangle::default(), Vec::new()),
         };
 
-        self.status = match &self.bars.status {
-            Some(bar) => {
-                // Narrow editors leave out the less important labels.
-                let bar = &chrome::fit(bar, width, 0.0);
-                let (height, _) = chrome::layout(bar, Point::ORIGIN, width, 0.0);
+        // Narrow editors leave out the less important labels.
+        let status = self.bars.status.as_ref().map(|bar| {
+            let bar = chrome::fit(bar, width, 0.0);
+            let (height, _) = chrome::layout(&bar, Point::ORIGIN, width, 0.0);
+            (bar, height)
+        });
+
+        // As tall as the content: the bars and the whole document. The
+        // layout is the one for the last reported size; a new width is
+        // laid out again on the next build.
+        if self.height == Length::Content {
+            let status_height = status.as_ref().map_or(0.0, |(_, height)| *height);
+            let height = y + self.page.layout.content_height + status_height;
+            constrained = bc.constrain(frust::kurbo::Size::new(constrained.width, height as f64));
+            size = Size::new(constrained.width as f32, constrained.height as f32);
+            self.size = size;
+        }
+
+        self.status = match status {
+            Some((bar, height)) => {
+                let bar = &bar;
                 let top = (size.height - height).max(y);
                 let (_, slots) = chrome::layout(bar, Point::new(0.0, top), width, 0.0);
                 (
@@ -2112,18 +2176,14 @@ impl Widget for EditorWidget {
         }
 
         // Blink while focused.
-        if self.page.focused && !self.page.link_open {
+        if self.page.typing() {
             let (_, next) = self.caret_phase();
             ctx.request_frame_paced_at(next.max(Duration::from_millis(16)));
         }
 
         // Typing in the page (not in a link field): the on-screen keyboard
         // and the input method, next to the caret.
-        if self.page.focused
-            && !self.page.link_open
-            && self.bars.dialog.is_none()
-            && !self.input_focused()
-        {
+        if self.page.typing() && self.bars.dialog.is_none() && !self.input_focused() {
             let (sx, sy) = self.page.scroll;
             let caret = self
                 .page

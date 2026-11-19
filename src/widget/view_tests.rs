@@ -806,3 +806,181 @@ fn a_narrow_status_bar_keeps_the_zoom_control() {
             .any(|item| matches!(item, Item::Row { .. }))
     );
 }
+
+// ------------------------------------------------------------------------
+// Read-only documents and content height
+// ------------------------------------------------------------------------
+
+fn read_only(markdown: &str) -> App {
+    let mut app = App::new(markdown);
+    app.editor.set_read_only(true);
+    app
+}
+
+impl<V: View<App>, F: FnMut(&mut App) -> V> Harness<V, F> {
+    /// Window position inside the character at `offset` of block `block`,
+    /// for a page at the top of the window (no toolbar).
+    fn at_top(&self, block: usize, offset: usize) -> (f32, f32) {
+        let (x, y, height) = self
+            .app
+            .editor
+            .layout
+            .borrow()
+            .caret(crate::doc::Pos::new(block, offset))
+            .expect("a caret position");
+        (x + 1.0, y + height / 2.0)
+    }
+
+    fn handled(&mut self, event: InputEvent) -> bool {
+        let outcome = self.root.event(&mut self.app, &event);
+        self.frame();
+        outcome.handled
+    }
+}
+
+#[test]
+fn a_read_only_editor_ignores_typing_and_pasting() {
+    let text = "hello world\n";
+    let mut h = Harness::new(read_only(text), editor_view);
+    let (x, y) = h.at_top(0, 2);
+    h.click(x, y);
+    assert!(h.app.editor.is_focused(), "it can still be focused");
+
+    h.type_text("typed");
+    h.named(NamedKey::Backspace);
+    h.named(NamedKey::Delete);
+    h.named(NamedKey::Enter);
+    h.named(NamedKey::Tab);
+    h.shortcut("b");
+    h.shortcut("x");
+    h.shortcut("v");
+    assert!(!h.root.take_paste_request(), "no paste is asked for");
+    h.event(InputEvent::EditCommand(EditCommand::Paste("pasted".into())));
+    h.ime(ImeEvent::Compose {
+        text: "wor".into(),
+        cursor: None,
+    });
+    h.ime(ImeEvent::Commit("word".into()));
+    assert_eq!(h.app.editor.markdown(), text);
+    assert!(!h.app.events.contains(&Event::Changed));
+
+    // Selecting and copying work.
+    h.shortcut("a");
+    h.shortcut("c");
+    assert_eq!(
+        h.root.take_clipboard_write().as_deref(),
+        Some("hello world")
+    );
+
+    // Keys it does not use go to the application.
+    let typed = InputEvent::Key(KeyEvent {
+        key: FrustKey::Character("q".into()),
+        modifiers: FrustModifiers::default(),
+        repeat: false,
+    });
+    assert!(!h.handled(typed));
+}
+
+#[test]
+fn a_read_only_editor_has_no_toolbar_and_no_keyboard() {
+    let editable = editor_alone("text\n").app.editor.viewport.get().height;
+    let mut h = Harness::new(read_only("text\n"), editor_view);
+    assert!(
+        h.app.editor.viewport.get().height > editable + 20.0,
+        "the page starts at the top"
+    );
+    h.touch_mode();
+    let (x, y) = h.at_top(0, 1);
+    h.tap(x, y);
+    assert!(h.app.editor.is_focused());
+    assert!(
+        !h.root.ime_state().is_some_and(|ime| ime.active),
+        "no on-screen keyboard"
+    );
+}
+
+#[test]
+fn a_read_only_editor_follows_links_with_a_click() {
+    let mut h = Harness::new(read_only("[the site](https://example.org)\n"), editor_view);
+    let (x, y) = h.at_top(0, 3);
+    h.click(x, y);
+    assert!(
+        h.app
+            .events
+            .contains(&Event::LinkClicked("https://example.org".into()))
+    );
+}
+
+#[test]
+fn a_read_only_context_menu_only_copies() {
+    let mut h = Harness::new(read_only("hello world\n"), editor_view);
+    let (x, y) = h.at_top(0, 2);
+    h.click(x, y);
+    h.shortcut("a");
+    h.event(InputEvent::Pointer(PointerEvent {
+        phase: PointerPhase::Down,
+        position: kurbo::Point::new(x as f64, y as f64),
+        button: PointerButton::Secondary,
+    }));
+    let labels: Vec<String> = super::super::menu::entries(&h.app.editor)
+        .into_iter()
+        .map(|entry| match entry {
+            super::super::menu::Entry::Item { label, .. } => label,
+            super::super::menu::Entry::Separator => "-".into(),
+        })
+        .collect();
+    assert_eq!(labels, ["Copy", "Select all"]);
+}
+
+fn fitted_view(app: &mut App) -> impl View<App> + use<> {
+    frust::column::<App>()
+        .child(
+            markdown_editor(&app.editor)
+                .toolbar(false)
+                .status_bar(false)
+                .height(Length::Content)
+                .view(|app: &mut App, action| {
+                    let output = app.editor.update(action);
+                    app.events.extend(output.events);
+                }),
+        )
+        .child(frust::button("Below", |app: &mut App| app.clicked += 1))
+}
+
+#[test]
+fn content_height_fits_the_document() {
+    let mut h = Harness::new(read_only("one line\n"), fitted_view);
+    h.frame();
+    let height = |h: &Harness<_, _>| h.app.editor.viewport.get().height;
+    let content = h.app.editor.layout.borrow().content_height;
+    assert!(
+        (height(&h) - content).abs() < 0.5,
+        "{} vs {content}",
+        height(&h)
+    );
+    assert!(height(&h) < 100.0, "{}", height(&h));
+
+    // The widget below follows the document.
+    h.click(10.0, height(&h) + 10.0);
+    assert_eq!(h.app.clicked, 1);
+
+    // A longer document: a taller editor, on the next frames.
+    let short = height(&h);
+    h.app.editor.set_markdown(&long_document());
+    h.frame();
+    h.frame();
+    assert!(height(&h) > short + 500.0, "{}", height(&h));
+    let content = h.app.editor.layout.borrow().content_height;
+    assert!((height(&h) - content).abs() < 0.5);
+}
+
+#[test]
+fn the_wheel_goes_to_the_parent_when_nothing_scrolls() {
+    let mut h = Harness::new(read_only("one line\n"), fitted_view);
+    let wheel = InputEvent::Scroll {
+        position: kurbo::Point::new(300.0, 10.0),
+        delta: frust::authoring::ScrollDelta::Lines(0.0, 3.0),
+    };
+    assert!(!h.handled(wheel));
+    assert_eq!(h.app.editor.scroll_y, 0.0);
+}

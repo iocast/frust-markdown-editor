@@ -151,7 +151,34 @@ pub(crate) fn entries(state: &EditorState) -> Vec<Entry> {
             });
         }
     }
+    if state.read_only {
+        entries = without_edits(entries, state);
+    }
     entries
+}
+
+/// The entries of a read-only document: copying and selecting, without
+/// separators left at the ends or next to each other.
+fn without_edits(entries: Vec<Entry>, state: &EditorState) -> Vec<Entry> {
+    let mut kept: Vec<Entry> = Vec::new();
+    for entry in entries {
+        match &entry {
+            Entry::Item {
+                action: Action(Inner::Command(command)),
+                ..
+            } if state.allows(command) => kept.push(entry),
+            Entry::Item { .. } => {}
+            Entry::Separator => {
+                if kept.last().is_some_and(|last| *last != Entry::Separator) {
+                    kept.push(entry);
+                }
+            }
+        }
+    }
+    if kept.last() == Some(&Entry::Separator) {
+        kept.pop();
+    }
+    kept
 }
 
 /// Top-left corner of a menu of `size` opened at `at`, kept inside `area`.

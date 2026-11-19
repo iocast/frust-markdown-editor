@@ -2,8 +2,8 @@
 
 | Item | Purpose |
 |---|---|
-| `EditorState` | Document, selection, history, settings |
-| `markdown_editor(&state)` | The widget (`.toolbar(bool)`, `.status_bar(bool)`, `.context_menu(bool)`, `.width(…)`, `.height(…)`, `.view(\|state, action\| …)` → `EditorView`) |
+| `EditorState` | Document, selection, history, settings; `.read_only(true)` / `set_read_only` to show rather than edit |
+| `markdown_editor(&state)` | The widget (`.toolbar(bool)`, `.status_bar(bool)`, `.context_menu(bool)`, `.width(…)`, `.height(…)` with a `Length`: `Fill`, `Fixed(px)` or `Content`, `.view(\|state, action\| …)` → `EditorView`) |
 | `Action`, `Output`, `Event`, `Command` | Message flow |
 | `Paper`, `PageSize`, `Margins`, `Measure` | Page setup |
 | `ZoomSettings`, `KeyBinding`, `Key`, `Named`, `Modifiers` | Zoom |
